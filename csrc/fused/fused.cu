@@ -1614,13 +1614,9 @@ static void launch_l2_reduce_quant(torch::Tensor input, torch::Tensor output,
   const uint32_t num_bh = batch_size * num_heads;
   if (red_tokens <= 0) red_tokens = 1024;
   TORCH_CHECK(red_tokens % 64 == 0, "red_tokens must be a multiple of 64");
-  if (lag < 0)
-  {
-    // lag 1 keeps ~2.5 heads of input live in L2; fall back to lag 0 when that does not fit.
-    const int64_t head_bytes = (int64_t)num_tokens * head_dim * input.element_size();
-    const int64_t l2_bytes = at::cuda::getCurrentDeviceProperties()->l2CacheSize;
-    lag = (3 * head_bytes <= l2_bytes) ? 1 : 0;
-  }
+  // lag must be explicit: a "pick by L2 size" heuristic was measured wrong on GB10
+  // (it selected lag 0 at 32k, which is the slower schedule).  Python passes the
+  // measured value (see sageattention/quant.py: L2_LAG).
   TORCH_CHECK(lag == 0 || lag == 1, "lag must be 0 or 1");
   const uint32_t R = (num_tokens + red_tokens - 1) / red_tokens;
   const uint32_t Qn = (num_tokens + kL2QuantTokens - 1) / kL2QuantTokens;

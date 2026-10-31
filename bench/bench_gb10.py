@@ -79,21 +79,37 @@ def bench_sa2(shapes, dtype, is_causal, stages):
 
 
 def stage_breakdown(q, k, v, dtype, is_causal):
-    """Time each preprocessing stage + kernel for the sm121 dispatch path."""
-    from sageattention.quant import per_warp_int8 as per_warp_int8_cuda, per_channel_fp8, sub_mean
+    """Time each preprocessing stage + kernel for the sm121 dispatch path.
+
+    Follows the real dispatch: with SAGEATTN_L2_FUSED=1 (default) the K mean is
+    computed inside the K quantizer and V's amax inside the transpose/quantize
+    kernel, so the separate `k.mean` pass does not happen.
+    """
+    import sageattention.quant as _q
+    from sageattention.quant import per_channel_fp8
     from sageattention import sm89_compile
     B, H, L, D = q.shape
-    t_mean = cuda_time(lambda: k.mean(dim=2, keepdim=True))
-    km = k.mean(dim=2, keepdim=True)
-    qkv = cuda_time(lambda: per_warp_int8_cuda(q, k, km, tensor_layout="HND", BLKQ=128, WARPQ=32, BLKK=64))
-    q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout="HND", BLKQ=128, WARPQ=32, BLKK=64)
+    fused = getattr(_q, "L2_FUSED", False)
+    if fused:
+        smooth_k = _q.per_warp_int8_smooth_k
+        t_k = cuda_time(lambda: smooth_k(q, k, tensor_layout="HND", BLKQ=128, WARPQ=32))
+        q_int8, q_scale, k_int8, k_scale, km = smooth_k(q, k, tensor_layout="HND", BLKQ=128, WARPQ=32)
+        t_mean = 0.0
+        kv_label = "quantK+mean(fused)"
+    else:
+        from sageattention.quant import per_warp_int8 as per_warp_int8_cuda
+        km = k.mean(dim=2, keepdim=True)
+        t_mean = cuda_time(lambda: k.mean(dim=2, keepdim=True))
+        t_k = cuda_time(lambda: per_warp_int8_cuda(q, k, km, tensor_layout="HND", BLKQ=128, WARPQ=32, BLKK=64))
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout="HND", BLKQ=128, WARPQ=32, BLKK=64)
+        kv_label = "per_warp_int8(q,k)"
     t_v = cuda_time(lambda: per_channel_fp8(v, tensor_layout="HND", scale_max=2.25, smooth_v=False))
     v_fp8, v_scale, vm = per_channel_fp8(v, tensor_layout="HND", scale_max=2.25, smooth_v=False)
     o = torch.empty_like(q)
     t_kernel = cuda_time(lambda: sm89_compile.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
         q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, 1, int(is_causal), 2, D ** -0.5, 0))
-    total = t_mean + qkv + t_v + t_kernel
-    print(f"    stages: k.mean {t_mean*1e3:7.1f}us | per_warp_int8(q,k) {qkv*1e3:7.1f}us | "
+    total = t_mean + t_k + t_v + t_kernel
+    print(f"    stages: k.mean {t_mean*1e3:7.1f}us | {kv_label} {t_k*1e3:7.1f}us | "
           f"per_channel_fp8(v) {t_v*1e3:7.1f}us | attn kernel {t_kernel*1e3:8.1f}us | sum {total*1e3:8.1f}us")
 
 

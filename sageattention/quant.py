@@ -28,7 +28,7 @@ L2_FUSED = os.environ.get("SAGEATTN_L2_FUSED", "1") != "0"
 #   lag: 1 = reduce(head h+1) overlaps quant(head h); 0 = strictly per head
 #        (lag 0 was slower at every size, SMs idle while spinning).
 #   red_tokens: tokens per reduce CTA, multiple of 64; 0 = _l2_red_tokens(L).
-L2_LAG = int(os.environ.get("SAGEATTN_L2_LAG", "1"))
+L2_LAG = 1 if int(os.environ.get("SAGEATTN_L2_LAG", "1")) != 0 else 0
 L2_RED_TOKENS = int(os.environ.get("SAGEATTN_L2_RED_TOKENS", "0"))
 
 

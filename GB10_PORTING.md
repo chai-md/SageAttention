@@ -270,6 +270,19 @@ num_stages, cluster）。GB10 は L2 24 MB なので kBlockN=256 で K/V 再読�
 sageattn3_blackwell` はそのまま動く。動画系ノードで SA3 を使う場合は
 `num_qo_heads == num_kv_heads`（GQA 非対応）と `head_dim ∈ {64,128}` の制約に注意。
 
+### P6: `head_dim` 80/96 のパディング除去（見込み -4〜5 ms @ L=32k）
+
+SA2 は `head_dim` が 64/128 以外だと `F.pad` で 128 に拡張する（`core.py`）。この 3 回の
+コピー（Q/K/V 各 1 パス read+write）が 32k で 4〜5 ms かかる。量子化カーネル側で
+「80/96 幅を読んで 128 幅に書く」ようにすれば pad を消せるが、3 つの量子化カーネル
+（`QuantInt8Kernel` / `per_channel_fp8` 系）に手を入れる必要がある。
+Flux/SD3.5 は 128 なので影響なし、SDXL 系や一部モデル（D=80/96）で効く。
+
+### P7: SA3 の K 3 回読み（見込み -0.9 ms @ L=16k）
+
+`k.mean` → `delta_s = qm @ kᵀ` → K 量子化 で K を 3 回読む。`delta_s` の GEMM を K 量子化
+カーネルに融合すれば 1 回減るが、tensor core を使う mma の再設計が必要（Claude の試算）。
+
 ---
 
 ## 6. 落とし穴
