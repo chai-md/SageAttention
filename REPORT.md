@@ -91,16 +91,17 @@ L=1000（パディングあり）の cos は ≈0.979（bf16/fp16）。venv に�
 
 ## 5. `git diff gb10-sm121 --stat`
 ```
- REPORT.md                                          | (this file)
- bench/sa3_extra.py                                 | (new: correctness + stage split)
- sageattention3_blackwell/sageattn3/api.py          | 53 +++++++++++----
- .../sageattn3/blackwell/api.cu                     |  2 +
- .../sageattn3/blackwell/kernel_traits.h            |  7 +-
- .../sageattn3/blackwell/launch.h                   |  2 +-
- .../sageattn3/blackwell/mainloop_tma_ws.h          | 22 ++++---
- .../sageattn3/quantization/fp4_quantization_4d.cu  | 76 ++++++++++++++++++++--
+ REPORT.md                                          | 110 +++++++++++++++++++++
+ bench/sa3_extra.py                                 |  52 ++++++++++
+ sageattention3_blackwell/sageattn3/api.py          |  53 +++++++---
+ .../sageattn3/blackwell/api.cu                     |   2 +
+ .../sageattn3/blackwell/kernel_traits.h            |   7 +-
+ .../sageattn3/blackwell/launch.h                   |   2 +-
+ .../sageattn3/blackwell/mainloop_tma_ws.h          |  22 +++--
+ .../sageattn3/quantization/fp4_quantization_4d.cu  |  76 ++++++++++++--
+ 8 files changed, 294 insertions(+), 30 deletions(-)
 ```
-（ソース 6 ファイル: 132 insertions(+), 30 deletions(-)。コミット後の正確な stat は `git diff gb10-sm121 --stat` で確認できる）
+（REPORT.md 自身の更新前の stat）
 
 ## 再現
 ```bash
