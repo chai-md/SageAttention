@@ -156,4 +156,19 @@ K 側の効果は `sa2_extra.py` で確認する。
 
 ## 5. `git diff gb10-sm121 --stat`
 
-（コード commit 後に貼り付け）
+コード commit（`git log -1` の 1 つ前）時点の値。REPORT.md の行数は、この貼り付け commit の分だけ変わる。
+
+```
+ REPORT.md              | 236 ++++++++++++++++------------
+ REPORT_SA3.md          | 111 +++++++++++++
+ bench/sa2_extra.py     | 118 ++++++++++++++
+ csrc/fused/fused.cu    | 410 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ csrc/fused/fused.h     |  19 ++-
+ csrc/fused/pybind.cpp  |   2 +
+ sageattention/core.py  |  28 ++--
+ sageattention/quant.py |  71 ++++++++-
+ 8 files changed, 887 insertions(+), 108 deletions(-)
+```
+
+（`REPORT.md` の差分が大きく見えるのは、1 回目の SA3 レポートを `REPORT_SA3.md` に移し、
+SA2 用に書き直したため。）
