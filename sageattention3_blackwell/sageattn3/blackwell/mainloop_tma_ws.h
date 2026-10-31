@@ -738,15 +738,30 @@ struct CollectiveMainloopFwd {
         auto col_limit_causal = [&](int row, int n_block) {
             return row + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
         };
+        // K is stored permuted inside every 32-token group (scale_and_quant_fp4_permute:
+        // position p holds token [0,1,8,9,16,17,24,25,2,3,...][p]), so column c of the S
+        // tile is key token k_token(c), not c.  add_delta_s already indexes by token;
+        // the masks must too, otherwise a key length that is not a multiple of 32 masks
+        // real keys / keeps padding keys, and the causal diagonal is wrong.
+        auto k_token = [](int c) {
+            return (c & ~31) | (((c >> 3) & 3) << 1) | (((c >> 1) & 3) << 3) | (c & 1);
+        };
         {
             Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
             Tensor tScS = thread_mma_qk.partition_C(cS);
+            // k_token of the compile-time (thread-0) column + a per-thread offset: the
+            // thread's N offset only occupies bits 1-2 (2 * (lane % 4)) and the static part
+            // never does, so this equals k_token(column) but folds to constants (applying
+            // k_token per element at runtime raised spills 24 -> 120 B and cost ~0.4 ms).
+            Tensor tScS0 = tiled_mma_qk.get_thread_slice(0).partition_C(cS);
+            int const tok_thr = k_token(int(get<1>(tScS(0))) - int(get<1>(tScS0(0))));
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < size(tSrS); ++i) {
+                int const tok = k_token(int(get<1>(tScS0(i)))) + tok_thr;
                 if constexpr (!Is_causal) {  // Just masking based on col
-                    if (int(get<1>(tScS(i))) >= int(unpadded_seqlen_k - n_block * kBlockN)) { tSrS(i) = -INFINITY; }
-                } else { 
-                    if (int(get<1>(tScS(i))) >= std::min(seqlen_k - n_block * kBlockN,
+                    if (tok >= int(unpadded_seqlen_k - n_block * kBlockN)) { tSrS(i) = -INFINITY; }
+                } else {
+                    if (tok >= std::min(seqlen_k - n_block * kBlockN,
                                                         col_limit_causal(int(get<0>(tScS(i))), n_block))) {
                         tSrS(i) = -INFINITY;
                     }
@@ -802,10 +817,25 @@ struct CollectiveMainloopFwd {
             }
         };
 
+        // Wait for V and pull its first smem->reg block *before* the softmax, so the
+        // LDSM latency (8 warps hitting smem at once) overlaps the exp2 work instead of
+        // sitting between softmax and the PV MMAs.  K of this n_block is already
+        // released, so the pipeline order (wait K, release K, wait V, release V) is
+        // unchanged; only independent loads move.  Output is bit-identical.
+        // Measured on GB10: -16% for D=128, but +5% for D=64 (its V tile is half the size
+        // and the longer live range costs more than the hidden latency), so D=64 keeps the
+        // original order.
+        static constexpr bool kEarlyV = kHeadDim == 128;
+        if constexpr (kEarlyV) {
+            consumer_wait(pipeline_v, smem_pipe_read_v);
+            copy_v_block(_0{});
+        }
         softmax_fused.template online_softmax_with_quant</*Is_first=*/true>(tSrS, AbsMaxP, mainloop_params.softmax_scale_log2);
+        if constexpr (!kEarlyV) {
+            consumer_wait(pipeline_v, smem_pipe_read_v);
+            copy_v_block(_0{});
+        }
 
-        consumer_wait(pipeline_v, smem_pipe_read_v);
-        copy_v_block(_0{});
         quantize(_0{}, tSrS_converion_view);
         CUTLASS_PRAGMA_UNROLL
         for (int v_block = 0; v_block < size<2>(tOrP); ++v_block) {
@@ -842,20 +872,32 @@ struct CollectiveMainloopFwd {
             ++smem_pipe_read_k;
             Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
             Tensor tScS = thread_mma_qk.partition_C(cS);
+            Tensor tScS0 = tiled_mma_qk.get_thread_slice(0).partition_C(cS);  // see the first n_block
+            int const tok_thr = k_token(int(get<1>(tScS(0))) - int(get<1>(tScS0(0))));
             #pragma unroll
             for (int i = 0; i < size(tSrS); ++i) {
-                if (int(get<1>(tScS(i))) >= col_limit_causal(int(get<0>(tScS(i))), n_block - 1)) {
+                // n_block is already this tile's index here (FA3's "n_block - 1" belonged to
+                // its software-pipelined loop).  Identical result whenever seqlen_k - seqlen_q
+                // is a multiple of kBlockN, which the padded Python path always guarantees.
+                if (k_token(int(get<1>(tScS0(i)))) + tok_thr >= col_limit_causal(int(get<0>(tScS(i))), n_block)) {
                     tSrS(i) = -INFINITY;
                 }
             }
+            if constexpr (kEarlyV) {  // see the first n_block
+                consumer_wait(pipeline_v, smem_pipe_read_v);
+                copy_v_block(_0{});
+            }
             softmax_fused.template online_softmax_with_quant</*Is_first=*/false>(tSrS, AbsMaxP, mainloop_params.softmax_scale_log2);
             Tensor tOrO = make_fragment_like(tOrO_store);
-            consumer_wait(pipeline_v, smem_pipe_read_v);
-            copy_v_block(_0{});
+            if constexpr (!kEarlyV) {
+                consumer_wait(pipeline_v, smem_pipe_read_v);
+                copy_v_block(_0{});
+            }
+            clear(tOrO);  // the PV MMAs accumulate into it; don't rely on undef == 0
             quantize(_0{}, tSrS_converion_view);
             CUTLASS_PRAGMA_UNROLL
             for (int v_block = 0; v_block < size<2>(tOrP); ++v_block) {
-                cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, v_block), tOrSFP(_, _, v_block)), 
+                cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, v_block), tOrSFP(_, _, v_block)),
                                     make_zip_tensor(tOrVt(_, _, v_block), tOrSFVt(_, _, v_block)), tOrO);
                 if (v_block < size<2>(tOrP) - 1) {
                     copy_v_block(v_block + 1);
@@ -864,7 +906,10 @@ struct CollectiveMainloopFwd {
             }
             pipeline_v.consumer_release(smem_pipe_read_v);
             ++smem_pipe_read_v;
-            if (masking_step > 0) { softmax_fused.rescale_o(tOrO_store, tOrO); }
+            // Every masking step accumulates its PV block into a fresh tOrO, so it must
+            // always be folded into tOrO_store.  (Upstream skipped step 0, which silently
+            // dropped one KV block per causal row-block: cos ~0.75 vs SDPA.)
+            softmax_fused.rescale_o(tOrO_store, tOrO);
         }
 
         #pragma unroll 1
@@ -885,14 +930,21 @@ struct CollectiveMainloopFwd {
                     ++smem_pipe_read_k;
                 }
             }
+            if constexpr (kEarlyV) {  // see the first n_block
+                consumer_wait(pipeline_v, smem_pipe_read_v);
+                copy_v_block(_0{});
+            }
             softmax_fused.template online_softmax_with_quant</*Is_first=*/false>(tSrS, AbsMaxP, mainloop_params.softmax_scale_log2);
             Tensor tOrO = make_fragment_like(tOrO_store);
-            consumer_wait(pipeline_v, smem_pipe_read_v);
-            copy_v_block(_0{});
+            if constexpr (!kEarlyV) {
+                consumer_wait(pipeline_v, smem_pipe_read_v);
+                copy_v_block(_0{});
+            }
+            clear(tOrO);  // the PV MMAs accumulate into it; don't rely on undef == 0
             quantize(_0{}, tSrS_converion_view);
             CUTLASS_PRAGMA_UNROLL
             for (int v_block = 0; v_block < size<2>(tOrP); ++v_block) {
-                cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, v_block), tOrSFP(_, _, v_block)), 
+                cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, v_block), tOrSFP(_, _, v_block)),
                                     make_zip_tensor(tOrVt(_, _, v_block), tOrSFVt(_, _, v_block)), tOrO);
                 if (v_block < size<2>(tOrP) - 1) {
                     copy_v_block(v_block + 1);
