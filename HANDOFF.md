@@ -22,10 +22,13 @@
   7. **SA2 の K/V 前処理を L2 常駐の融合カーネルに**（`L2ReduceQuantKernel`。K: mean+int8、
      V: amax+transpose+fp8 をそれぞれ 1 launch に。旧経路とビット一致、
      `SAGEATTN_L2_FUSED=0` で無効化可）
+  8. **SA3 の upstream バグ 2 件を修正**（キーマスクが K の 32 トークン置換を無視 / causal の
+     masking step 0 の PV 脱落）+ **V ロードを softmax の前に移動**（-16%）
 * 検証済み: SA2 V 量子化は旧経路とビット一致、smoke test 全通過、
-  cos 0.9993 (SA2) / 0.9818 (SA3、全サイズで不変)、48 形状のストレスでも cos ≥ 0.99923。
+  cos 0.9993 (SA2) / 0.9818 (SA3 非 causal) / 0.984 (SA3 causal)、48 形状ストレスで cos ≥ 0.99923、
+  `sa3_mask_test.py` 44 ケース worst 0.9806（修正前は 0.46）。
 * 現状の速度（bf16, H=24, D=128, vs SDPA）: SA2 1.65x @8k / 1.80x @16k / 1.91x @32k、
-  **SA3 2.05x @16k**（19.88 ms）。
+  SA3 **1.86x @8k / 2.27x @16k / 2.65x @32k**。
 
 ---
 
@@ -60,6 +63,8 @@ MAX_JOBS=8 /home/chai/ComfyUI/.venv/bin/uv pip install --python /home/chai/Comfy
 cd /tmp
 python /home/chai/SageAttention/bench/verify_v_quant.py     # SA2: V量子化のビット一致
 python /home/chai/SageAttention/bench/smoke_test.py        # 全 dtype/layout/causal/GQA
+python /home/chai/SageAttention/bench/sa3_mask_test.py      # SA3: causal と短い K 長（44 ケース・必須）
+python /home/chai/SageAttention/bench/stress_l2_fused.py    # SA2: L2 融合カーネル 48 形状＋連続呼び出し
 python /home/chai/SageAttention/bench/bench_gb10.py --suite sa2 --stages
 python /home/chai/SageAttention/bench/bench_gb10.py --suite sa3
 python /home/chai/SageAttention/bench/bench_v_quant_ab.py  # V量子化の A/B
@@ -111,6 +116,12 @@ SAGE3_NUM_SM=96 python /home/chai/SageAttention/bench/bench_gb10.py --suite sa3 
 * `delta_s` の定数項削除は「lse を返さない」前提。`return_lse` 相当を実装するなら項を戻す。
 * ベンチは**リポジトリ外**（`/tmp` など）から。直下だと `import sageattention` がソースを掴んで落ちる。
 * `ncu` は使えない（`ERR_NVGPUCTRPERM`）。CUDA event の A/B と `--stages` で判断する。
+* **ヘッダ（.h）だけ編集しても `setup.py build_ext` は再ビルドしない**（distutils がヘッダ依存を
+  追跡しない）。`.so` が古いまま計測して「効果なし」と誤判定する事故が実際に起きた。
+  `.h` を触ったら `touch sageattn3/blackwell/api.cu`（SA2 なら `csrc/fused/fused.cu`）してからビルドする。
+* SA3 の**マスク経路**（`mainloop_tma_ws.h` の `k_token()`）は K の 32 トークン置換に依存している。
+  `scale_and_quant_fp4_permute` の並びを変えるなら、マスク側も同時に直すこと
+  （`bench/sa3_mask_test.py` が検出する）。
 * 顧客データ・非公開情報をこのリポジトリに置かない（公開 OSS のフォーク）。
 
 ---
@@ -150,14 +161,18 @@ bf16, H=24, D=128, non-causal, SDPA(fp16/bf16) 比:
 
 | L | SA2 | SA3 |
 |---:|---:|---:|
-| 4 096 | 0.80 ms (1.24x) | 0.67 ms (1.47x) |
-| 8 192 | 6.67 ms (1.56x) | 6.85 ms (1.55x) |
-| 16 384 | 23.41 ms (1.80x) | 21.94 ms (1.87x) |
-| 32 768 | 87.74 ms (1.89x) | — |
+| 4 096 | 0.74 ms (1.34x) | 0.57 ms (1.73x) |
+| 8 192 | 6.39 ms (1.65x) | 5.66 ms (1.86x) |
+| 16 384 | 23.2 ms (1.80x) | 17.96 ms (2.27x) |
+| 32 768 | 87.4 ms (1.91x) | 63.08 ms (2.65x) |
 
-SA3 内訳（L=16 384, 合計 21.9 ms）: attn kernel 16.1 / delta_s matmul 0.92 / delta_s→fp32 1.31 /
-k.mean 0.46 / qm 0.43 / quant Q+K+V 1.69。
-→ 次の 1 手は T1（delta_s bf16）が最も効く。
+SA3 内訳（L=16 384, 合計 16.6 ms）: attn kernel 13.66 / delta_s matmul 0.94 / k.mean 0.44 /
+quant Q(+qm) 0.53 / quant K 0.54 / quant V 0.53。
+SA2 内訳（同, 合計 23.2 ms）: attn kernel 20.5 / quantK+mean 1.66 / V quant 1.06。
+
+律速: 実測上限は FP4 430 TFLOPS / int8・fp8 215。SA3 は 57%、SA2 は 75%。
+残りは**ワープ内の直列チェーン（MMA→softmax→量子化→MMA）のレイテンシ**で、
+次の一手は P4（warpgroup ping-pong）と P4b（delta_s init の先読み）。詳細は `reviews/claude-opus55-audit.md`。
 
 ---
 

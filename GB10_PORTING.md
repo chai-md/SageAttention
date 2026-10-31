@@ -15,16 +15,17 @@ Python 3.13.14, venv `/home/chai/ComfyUI/.venv`
 | SA3 の 170 SM ハードコード | デバイス問い合わせに修正（48 SM で最適、170 比 **-9.5%**） |
 | GB10 帯域対策 (第 1 弾) | SA3 前処理の全テンソル往復を削除、SA2 の V 量子化を 3 パス → 2 パス（**1.12–1.46x**） |
 | GB10 帯域対策 (第 2 弾, Claude Code レビュー) | SA3 `delta_s` を 16-bit のままカーネルへ + `qm` を量子化カーネル内で計算 → **L=16k 21.9 → 19.9 ms** |
-| 数値検証 | SA2 の V 量子化は旧経路と **ビット一致**、SA3 は全サイズで cos 不変（0.9818） |
+| GB10 帯域対策 (第 3 弾, Claude Code 監査) | SA3 の **upstream バグ 2 件**（キーマスクのトークン置換漏れ / causal step 0 の PV 脱落）を修正 + V ロードを softmax 前に移動 → **L=16k 19.9 → 18.0 ms**、causal の cos 0.72 → 0.984 |
+| 数値検証 | SA2 の V 量子化は旧経路と **ビット一致**、SA3 は非 causal・L%128==0 で**ビット一致**、causal は修正で大幅改善 |
 
 実測（bf16, H=24, D=128, causal=False、SDPA(FP16/BF16) 比）:
 
-| L | SA2 SDPA | SA2 最終 | SA2 速度比 | SA3 初回後 | SA3 最終 | SA3 速度比 |
+| L | SA2 SDPA | SA2 | SA2 速度比 | SA3 SDPA | SA3 | SA3 速度比 |
 |---:|---:|---:|---:|---:|---:|---:|
-| 4 096 | 0.99 ms | 0.74 ms | 1.34x | 0.67 ms | 0.64 ms | 1.54x |
-| 8 192 | 10.5 ms | 6.39 ms | 1.65x | 6.85 ms | 5.89 ms | 1.78x |
-| 16 384 | 42.1 ms | 23.2 ms | 1.80x | 21.94 ms | 19.88 ms | 2.05x |
-| 32 768 | 167 ms | 87.4 ms | 1.91x | — | — | — |
+| 4 096 | 0.99 ms | 0.74 ms | 1.34x | 0.98 ms | 0.57 ms | 1.73x |
+| 8 192 | 10.5 ms | 6.39 ms | 1.65x | 10.5 ms | 5.66 ms | 1.86x |
+| 16 384 | 42.1 ms | 23.2 ms | 1.80x | 40.8 ms | 17.96 ms | 2.27x |
+| 32 768 | 167 ms | 87.4 ms | 1.91x | 167 ms | 63.08 ms | **2.65x** |
 
 ---
 
@@ -186,6 +187,38 @@ softmax で完全にキャンセルする。このカーネルは logsumexp を�
 
 レビュー本文は `reviews/claude-sa2-l2-fused.md`（SA3 側は `reviews/claude-sa3-delta-s-bf16.md`）。
 
+### 2.8 第 4 弾: 第三者監査（Claude Opus 5.5）で見つかった upstream バグと追加高速化
+
+`reviews/claude-opus55-audit.md` が監査レポート。**SA3 には upstream 由来の正しさのバグが 2 つ**あった。
+
+1. **C-1: キーマスクが K の 32 トークン置換を無視していた**（`mainloop_tma_ws.h`）。
+   K 量子化器は 32 トークンごとに `[0,1,8,9,16,17,24,25,2,3,…]` の順に並べ替えて格納するため、
+   S タイルの列 c に対応するキーは `k_token(c)` であって c ではない。マスクは生の列番号で比較していた。
+   * 実害: `kv_len % 32 != 0` で実キーが落ちパディングキーが残る（キー 8 個で P の行和が 0.12）、
+     causal の対角がずれる。乱数入力では L=1000 の cos が 0.979 と「軽微」に見えていたが、
+     チャネル平均の大きい実モデルではダミーキーが重みを奪う。
+   * 修正: `k_token()` を追加し、スレッド 0 の列（定数畳み込み）＋スレッドオフセットに分解。
+     素朴に per-element で計算すると spill が 24 → 120 B に増えて 0.4 ms 遅くなるため。
+2. **C-2: causal で masking step 0 の PV 寄与を捨てていた**（`if (masking_step > 0)`）。
+   `kBlockM == kBlockN` では masking step は 0 番しかないため、その寄与が常に脱落していた。
+   修正後 causal の cos は 0.71–0.79 → **0.983–0.985**（L=1000 は 0.979 → 0.982、キー 8 個は 0.47 → 0.989）。
+   非 causal かつ L%128==0 の出力は**ビット一致**。
+3. 併せて、未初期化アキュムレータへの依存（`tOrO`）を `clear()` で明示化（出力はビット一致）。
+
+高速化（正しさの修正とは独立）: D=128 で V の `consumer_wait` と 1 本目の smem→reg を softmax の
+**前**へ移動。LDSM のレイテンシが exp2 と重なる。カーネル **16.0 → 13.4 ms（-16%）**、
+end-to-end 19.9 → 18.0 ms。D=64 は V タイルが半分で逆効果（+5%）のため従来順序のまま。
+
+**この監査で分かった「本当の律速」**: 実測上限は FP4 `mma.sync` が **430 TFLOPS**（公称 500 は 2.5 GHz 前提、
+持続は約 2.17 GHz）、int8/fp8 が **215**。SA3 は 245/430 = 57%、SA2 は 161/215 = 75%。
+アブレーション（各段を外すと合計が全体時間を超える）から、カーネルは**演算でも帯域でもなく、
+ワープ内の「MMA → softmax → 量子化 → MMA」直列チェーンのレイテンシ**で律速されている
+（2 warp/SMSP では互いの位相がずれず、テンソルコアと MUFU が重ならない）。
+
+> 注意: 以前の「SA3 は非 causal L=2048 で cos 0.98、問題なし」という検証は、
+> 上記 2 バグが発現しない条件だけを見ていた。`bench/sa3_mask_test.py`（44 ケース）を追加したので、
+> 以後は causal・短い K 長も必ず回すこと。
+
 ---
 
 ## 3. 数値検証
@@ -194,6 +227,8 @@ softmax で完全にキャンセルする。このカーネルは logsumexp を�
 cd /tmp   # ← リポジトリ直下で実行すると source tree が site-packages を隠す
 python /home/chai/SageAttention/bench/verify_v_quant.py   # SA2 V量子化のビット一致
 python /home/chai/SageAttention/bench/smoke_test.py       # fp16/bf16, GQA, NHD, causal, D=64/128
+python /home/chai/SageAttention/bench/sa3_mask_test.py    # SA3 の causal / 短い K 長（44 ケース）
+python /home/chai/SageAttention/bench/stress_l2_fused.py  # SA2 の L2 融合カーネル（48 形状＋連続呼び出し）
 python /home/chai/SageAttention/bench/bench_gb10.py --suite sa2 --stages
 python /home/chai/SageAttention/bench/bench_gb10.py --suite sa3
 ```
@@ -208,6 +243,8 @@ smoke test の結果（SDPA fp32 リファレンスとの比較）:
 | SA2 causal L4096 | 0.1537 | 0.99938 |
 | SA3 bf16 L2048 D128 | 0.0639 | 0.98213 |
 | SA3 bf16 L2048 D64 | 0.0688 | 0.98098 |
+| SA3 causal L2048/4096 | — | 0.9843–0.9845 |
+| SA3 mask test（44 ケース、L%32≠0・キー 4/8/16/40/136） | — | worst 0.98058 |
 
 SA3 の cos 0.98 は FP4 量子化由来（E2M1 は 3 有効ビット）。上流実装と同じ水準。
 
@@ -215,23 +252,30 @@ SA3 の cos 0.98 は FP4 量子化由来（E2M1 は 3 有効ビット）。上�
 
 ## 4. なぜこれ以上速くならないか（ローフライン）
 
-`bench/roofline_gb10.py` の実測:
+`bench/roofline_gb10.py` と、Opus 5.5 監査の生 PTX マイクロベンチ（`bench/opus55/mb*.cu`）の実測:
 
 | 指標 | GB10 実測 | 備考 |
 |---|---:|---|
 | D2D copy | **218–222 GB/s** | 公称 273 GB/s の約 80% |
 | bf16 GEMM (cuBLAS, 8192³) | 77.4 TFLOPS | |
-| int8 GEMM (`torch._int_mm`) | 53.3 TOPS | torch 側の実装律速。テンソルコア上限の参考にはならない |
-| SM clock | 2 184 MHz (max 3 003) | 電力上限で頭打ち（50 W 時点） |
+| int8 `mma.sync m16n8k32` s32 acc | **215 TOPS** | 生命令。これが int8 の実上限 |
+| fp8 e4m3 `mma.sync` f32 / f16 acc | **215 TFLOPS** | GB10 では f16 acc にしても速くならない |
+| **NVFP4 `mma.sync.kind::mxf4nvf4.block_scale` m16n8k64 f32 acc** | **430 TFLOPS** | 公称 500 は 2.5 GHz 前提。持続クロック ~2.17 GHz |
+| `ex2.approx` (MUFU) | ~16/clk/SM | softmax の理論コスト |
+| `cvt.rn.satfinite.e2m1x2.f32` | 113/clk/SM | P→FP4 変換はフルレート |
+| SM clock | 2 184 MHz (max 3 003) | 電力上限で頭打ち |
 
-SA2 のアテンションカーネル単体（L=32 768, H=24, D=128）は 80 ms で、
-論理 FLOPs 1.3e13 → **約 161 TOPS**（int8 QK + fp8 PV の混合）。BF16 の 2 倍級のテンソルコアを
-使っていることを踏まえると **ピークの 6–7 割**まで来ており、残りは L2 帯域（K/V の再読込）と
-占有率（レジスタ 200 本超／CTA 128 スレッドで 2 CTA/SM）で決まっている。
-ncu は `ERR_NVGPUCTRPERM` で使用不可（このホストではパフォーマンスカウンタ権限なし）。
+現在地: **SA2 161/215 = 75%**、**SA3 245/430 = 57%**（修正前は 48%）。
 
-→ **帯域側で削れるのは「無駄なパス」だけ**。今回の 2 つの変更（SA3 の mean 融合、SA2 の V 2 パス化）
-はまさにそこを突いたもので、効果もそこそこに留まる。これ以上の大物はカーネル構造の変更になる。
+アブレーション（各段を 1 つ外して計測、`REVIEW.md` §3.2）で分かったこと:
+
+* 全段を外したときの短縮量の合計が全体時間（16 ms）を大きく超える → 各段は**同一の直列チェーン**上にある。
+* 1 タイルの内訳は MMA 2048 cycle + MUFU 1312 cycle + その他 ~900 cycle で、実測 ~4250 cycle/タイルとほぼ一致。
+  つまり **2 warp/SMSP が同位相で「MMA → softmax → 量子化 → MMA」を進めており、テンソルコアと MUFU が重なっていない**。
+* stages 2→3 は ±0（producer は律速でない）、kBlockN 拡大は smem/レジスタで不可。
+  V の ldmatrix を softmax の前に出すだけで -2.5 ms（-16%）になったのは、レイテンシが露出していた証拠。
+
+→ **帯域でも演算でもなく、ワープ内の依存チェーンのレイテンシが律速**。次の一手は「重ねる」ことしかない。
 
 ---
 
@@ -258,11 +302,19 @@ RO アキュムレータが 128 float/thread で上限を作っている。
 * 現実的な次の一手: `pv_accum_dtype="fp32"` 系（RO を 64 bit に落とす）で 3 CTA/SM を狙う、
   あるいは fp8 アキュムレータ版カーネルの追加。いずれも数値検証が必須。
 
-### P4: SA3 アテンションカーネルの stages/cluster チューニング
+### P4: SA3 アテンションカーネルを「重ねる」（見込み -3〜4 ms @ L=16k）
 
-`launch.h` の `Flash_fwd_kernel_traits<Headdim, 128, 128, 3, 1, per_block, T, O>`（kBlockM, kBlockN,
-num_stages, cluster）。GB10 は L2 24 MB なので kBlockN=256 で K/V 再読込を半減できる可能性。
-`delta_s` が 16-bit になったぶん smem に余裕ができている（ステージ数を増やす余地）。
+監査の結論: stages 増加も kBlockN 拡大も効かない（前者は ±0、後者は smem/レジスタで不可）。
+効くのは **consumer warpgroup の ping-pong**（名前付き障壁で WG1 の MMA と WG2 の softmax を交互に）
+または FA3 式のワープ内ソフトウェアパイプライン（QK(n+1) を softmax(n) の前に発行）。
+見積り 13.4 → 9.5–10.5 ms。S アキュムレータの二重化は +64 reg 必要で、ping-pong の方がレジスタ的に安全。
+障壁なしで位相をずらすだけでは再同期して ±0 だったので、**障壁で強制**すること。
+
+### P4b: `delta_s` の初期化をクリティカルパスから外す（見込み -1〜2 ms @ L=16k）
+
+init を消すと -2.9 ms、定数 init でも -2.0 ms。前タイルの PV フェーズ中に次ステージの delta_s
+（1 スレッド 32 値 = bf16x2 で 16 reg）を先読みし、QK 開始時は MOV だけで済ませる。
+MMA の後に足す方式（post-add）は +0.6 ms で逆効果だった。
 
 ### P5: ComfyUI 連携
 
