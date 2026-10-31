@@ -13,17 +13,18 @@ Python 3.13.14, venv `/home/chai/ComfyUI/.venv`
 | SA 2.2.0 ビルド (C++20 + `sm_121a`) | 成功。`_qattn_sm80` / `_qattn_sm89` / `_fused` 生成 |
 | SA3 ビルド (C++20 + `sm_121a`, CUTLASS head) | 成功。`fp4attn_cuda` / `fp4quant_cuda` 生成 |
 | SA3 の 170 SM ハードコード | デバイス問い合わせに修正（48 SM で最適、170 比 **-9.5%**） |
-| GB10 帯域対策 | SA3 前処理の全テンソル往復を削除（L=16k で 7.14 ms → 3.23 ms）、SA2 の V 量子化を 3 パス → 2 パス（**1.12–1.46x**） |
-| 数値検証 | SA2 の V 量子化は旧経路と **ビット一致**、SA3 は SDPA 比 cos 0.982（FP4 の誤差域） |
+| GB10 帯域対策 (第 1 弾) | SA3 前処理の全テンソル往復を削除、SA2 の V 量子化を 3 パス → 2 パス（**1.12–1.46x**） |
+| GB10 帯域対策 (第 2 弾, Claude Code レビュー) | SA3 `delta_s` を 16-bit のままカーネルへ + `qm` を量子化カーネル内で計算 → **L=16k 21.9 → 19.9 ms** |
+| 数値検証 | SA2 の V 量子化は旧経路と **ビット一致**、SA3 は全サイズで cos 不変（0.9818） |
 
 実測（bf16, H=24, D=128, causal=False、SDPA(FP16/BF16) 比）:
 
-| L | SA2 SDPA | SA2 変更後 | SA2 速度比 | SA3 変更前 | SA3 変更後 | SA3 速度比 |
+| L | SA2 SDPA | SA2 最終 | SA2 速度比 | SA3 初回後 | SA3 最終 | SA3 速度比 |
 |---:|---:|---:|---:|---:|---:|---:|
-| 4 096 | 0.99 ms | 0.80 ms | 1.24x | 0.75 ms | 0.67 ms | 1.47x |
-| 8 192 | 10.4 ms | 6.67 ms | 1.56x | 7.81 ms | 6.85 ms | 1.55x |
-| 16 384 | 42.1 ms | 23.4 ms | 1.80x | 25.07 ms | 21.94 ms | 1.87x |
-| 32 768 | 165.8 ms | 87.7 ms | 1.89x | — | — | — |
+| 4 096 | 0.99 ms | 0.74 ms | 1.34x | 0.67 ms | 0.64 ms | 1.54x |
+| 8 192 | 10.5 ms | 6.39 ms | 1.65x | 6.85 ms | 5.89 ms | 1.78x |
+| 16 384 | 42.1 ms | 23.2 ms | 1.80x | 21.94 ms | 19.88 ms | 2.05x |
+| 32 768 | 167 ms | 87.4 ms | 1.91x | — | — | — |
 
 ---
 
@@ -143,6 +144,47 @@ softmax で完全にキャンセルする。このカーネルは logsumexp を�
   に張り付いており、削れるのは「パス数」だけ。V 以外は既に最小パス。
 * **SA3 の FP4 アテンションカーネル**（`kernel_ws.h` 系）は CUTLASS の warp-specialized 実装で、
   stages/cluster のチューニングは別途（下記 5 章）。
+* **SA2 アテンションカーネルのタイル形状**は動かさない。`CTA_K=64 → 128` を試したところ、
+  コンパイルは通るが **出力が壊れる**（cos 0.31 / NaN）。smem の swizzle と permutation が
+  `CTA_K=64, V_SMEM_STRIDE=CTA_K` 前提で組まれているため、タイルだけ変えるのは不可（下記 5 章 P3）。
+
+### 2.6 第 2 弾: 外部レビュー（Claude Code）で入った SA3 の改善
+
+`GB10_PORTING.md` の初版を書いた後に、SA3 を独立レビューさせて 2 点を追加した
+（ブランチ `review-claude`、レポートは同ブランチの `REPORT.md`）。
+
+1. **`delta_s` を 16-bit のままカーネルに渡す**（`-1.31 ms @ L=16k`）
+   * 旧: bf16 GEMM → `.to(torch.float32)`（**1.31 ms**）→ カーネルが fp32 タイルとして read。
+   * 新: `kernel_traits.h` の `ElementDS = ElementOut`、`smem_ds` を 16-bit に、
+     `mainloop_tma_ws.h` の `add_delta_s` は 16 B の smem ロード 1 回を
+     `cutlass::NumericArrayConverter<float, ElementDS, 8>` で float4 × 2 に変換。
+     TMA の `TmaTransactionBytesK` と `api.cu` の dtype チェックも更新。
+   * 数値は**ビット単位で同一**（bf16 → fp32 の拡大は情報を増やさない）。cos も全サイズで不変。
+2. **`qm`（128 トークン平均）を Q 量子化カーネル内で計算**（`-0.43 ms @ L=16k`）
+   * 量子化カーネルは 1 CTA = 128 トークン = ちょうど 1 グループなので、warp shuffle + smem 縮約で
+     列平均を出し、`mean_out` として書き戻しつつ `x - mean` を量子化する。
+   * 端数ブロックは 0 埋めされているため、平均は旧経路（パディング込みの `q.view().mean()`）と一致。
+
+合計 **L=16k で 21.9 → 19.9 ms（-8.4%）**、SDPA 比 1.87x → **2.05x**。
+
+### 2.7 第 3 弾: 外部レビュー（Claude Code, SA2 担当）で入った改善
+
+`csrc/fused/fused.cu` に **L2 常駐型の「縮約 → 量子化」融合カーネル** `L2ReduceQuantKernel` を追加。
+
+* K: `k.mean()` と K の int8 量子化を 1 launch に統合。V: amax と transpose+fp8 を 1 launch に統合。
+  1 ヘッド分（32k×128 で 8.4 MB）は L2（24 MB）に収まるので、量子化パスは DRAM ではなく L2 から再読する。
+* CTA は起動順に atomic なチケットを取得し、`reduce` と `quant` の役割を自己選択。quant CTA は
+  自ヘッドの reduce 完了フラグを spin-wait する。チケット順序から「待つ側は必ず待たれる側より
+  後」が保証されるのでデッドロックしない。`lag=1` で reduce(h+1) と quant(h) を重ねる。
+* 出力は旧経路と**ビット一致**（`bench/verify_v_quant.py`、3 レイアウト）。
+  48 形状（fp16/bf16 × GQA × 奇数長 1000/3001/4097 × D=64/128）＋ causal ＋ NHD の
+  ストレステストで cos ≥ 0.99923、60 回連続呼び出しでも安定（`bench/stress_l2_fused.py`）。
+* 効果: 前処理が L=16k で -0.68 ms、L=32k で -0.66 ms。エンドツーエンドでは
+  **L=8k で -7.6%（6.74→6.39 ms）**、L=16k で -2〜3%、L=32k では実行ごとのばらつきと同程度。
+* `SAGEATTN_L2_FUSED=0` で旧経路（別カーネル 2 発）に戻せる。`SAGEATTN_L2_LAG` /
+  `SAGEATTN_L2_RED_TOKENS` でチューニング可。
+
+レビュー本文は `reviews/claude-sa2-l2-fused.md`（SA3 側は `reviews/claude-sa3-delta-s-bf16.md`）。
 
 ---
 
@@ -195,32 +237,32 @@ ncu は `ERR_NVGPUCTRPERM` で使用不可（このホストではパフォー�
 
 ## 5. 残タスク（優先度順・見積りつき）
 
-### P1: SA3 `delta_s` を bf16 でカーネルに渡す（見込み -1.7 ms @ L=16k, 約 8%）
+### ~~P1: SA3 `delta_s` を 16-bit でカーネルに渡す~~ → 完了（-1.31 ms @ L=16k）
 
-現状 `delta_s` は fp32 でカーネルに渡すため、`matmul`(bf16) → `.float()`（L=16k で 1.3 ms）→
-カーネルの fp32 タイル read（~0.9 ms）が残っている。`SmemLayoutDS` / `add_delta_s` /
-TMA ディスクリプタ（`api.cu`）を bf16 化すれば両方半減。
-触るファイル: `blackwell/kernel_traits.h`（`ArrayEngine<float>` → bf16、`SmemLayoutDS`）、
-`blackwell/mainloop_tma_ws.h`（`recast<float4>` の読み出しを bf16x4 → float4 変換に）、
-`blackwell/api.cu`（`delta_s` の TMA 生成と `params.delta_s_ptr` の型）。
+`kernel_traits.h` / `mainloop_tma_ws.h` / `launch.h` / `api.cu` / `api.py` を変更。
+詳細は 2.6 節。数値はビット単位で同一。
 
-### P2: SA3 の `qm`（128 トークン平均）を量子化カーネル内で計算（見込み -0.4 ms @ L=16k）
+### ~~P2: SA3 の `qm` を量子化カーネル内で計算~~ → 完了（-0.43 ms @ L=16k）
 
-`scaled_fp4_quant_kernel` は 1 CTA = 128 トークン × head_dim なので、ブロック内で列方向の
-平均を smem 縮約で出せば `qm` の別パス（0.43 ms）が消える。`qm` は `delta_s` にも必要なので、
-`delta_s` を先に作る都合上、実装は「平均だけ先に出す小型カーネル」との比較になる。
+`scaled_fp4_quant_kernel` に `mean_out` を追加（warp shuffle + smem 縮約）。
 
-### P3: SA2 アテンションカーネルの占有率
+### P3: SA2 アテンションカーネルの占有率（要注意・難物）
 
-`CTA_Q=128, CTA_K=64, WARP_Q=32, WARP_K=64`（`sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn.cu`）。
-RO アキュムレータが 128 float/thread で 2 CTA/SM 止まり。
-実験候補: (a) `CTA_K=128`（反復半減、smem 48 KB、1 CTA/SM）、(b) `CTA_Q=64`（占有率↑・帯域↓）。
-どちらも 1 ファイル再ビルド（~1 分）で A/B 可能。
+`CTA_Q=128, CTA_K=64, WARP_Q=32, WARP_K=64`、226 レジスタ/スレッド、2 CTA/SM（8 warps/SM）。
+RO アキュムレータが 128 float/thread で上限を作っている。
+
+* **試行済み・失敗**: `CTA_K=128` にすると**出力が壊れる**（cos 0.31 / NaN）。smem の swizzle
+  （`V_SMEM_STRIDE = CTA_K`）と permutation が `CTA_K=64` 前提で組まれているため、タイル寸法だけの
+  変更は不可。やるなら swizzle/permutation ごと再設計する必要がある（`permuted_smem.cuh`,
+  `attn_utils.cuh` の `load_global_to_share` 系）。
+* 現実的な次の一手: `pv_accum_dtype="fp32"` 系（RO を 64 bit に落とす）で 3 CTA/SM を狙う、
+  あるいは fp8 アキュムレータ版カーネルの追加。いずれも数値検証が必須。
 
 ### P4: SA3 アテンションカーネルの stages/cluster チューニング
 
 `launch.h` の `Flash_fwd_kernel_traits<Headdim, 128, 128, 3, 1, per_block, T, O>`（kBlockM, kBlockN,
 num_stages, cluster）。GB10 は L2 24 MB なので kBlockN=256 で K/V 再読込を半減できる可能性。
+`delta_s` が 16-bit になったぶん smem に余裕ができている（ステージ数を増やす余地）。
 
 ### P5: ComfyUI 連携
 

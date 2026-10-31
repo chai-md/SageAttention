@@ -17,7 +17,15 @@
   2. SA3 の mean 減算を FP4 量子化カーネルに融合（Q は 128 トークン毎、K は全系列の平均）
   3. SA3 の `delta_s` から softmax 不変な定数項を削除
   4. SA2 の V 量子化を 3 パス → 2 パス（`channel_amax_cuda` + `transpose_pad_permute_quant_cuda`）
-* 検証済み: SA2 V 量子化は旧経路とビット一致、smoke test 全通過、SDPA 比 cos 0.9993 (SA2) / 0.982 (SA3)。
+  5. **SA3 `delta_s` を 16-bit のままカーネルへ**（fp32 変換 1.31 ms を削除、TMA/smem も 16-bit 化）
+  6. **SA3 `qm` を Q 量子化カーネル内で計算**（`mean_out`、Q の余分な 1 パスを削除）
+  7. **SA2 の K/V 前処理を L2 常駐の融合カーネルに**（`L2ReduceQuantKernel`。K: mean+int8、
+     V: amax+transpose+fp8 をそれぞれ 1 launch に。旧経路とビット一致、
+     `SAGEATTN_L2_FUSED=0` で無効化可）
+* 検証済み: SA2 V 量子化は旧経路とビット一致、smoke test 全通過、
+  cos 0.9993 (SA2) / 0.9818 (SA3、全サイズで不変)、48 形状のストレスでも cos ≥ 0.99923。
+* 現状の速度（bf16, H=24, D=128, vs SDPA）: SA2 1.65x @8k / 1.80x @16k / 1.91x @32k、
+  **SA3 2.05x @16k**（19.88 ms）。
 
 ---
 
