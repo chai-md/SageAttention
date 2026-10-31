@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Stage breakdown for SageAttention3 on GB10 (post mean-fusion)."""
+"""Stage breakdown for SageAttention3 on GB10, following the *real* dispatch.
+
+Mirrors `sageattn3_blackwell()` with per_block_mean=True (the default):
+  km = k.mean -> pad -> Q quantizer (also emits qm) -> delta_s = qm @ k^T
+  -> K quantizer (subtracts km) -> V quantizer -> fp4 attention kernel
+"""
 import sys
 
 import torch
@@ -18,25 +23,24 @@ def main():
         k = torch.randn(B, H, L, D, device="cuda", dtype=dtype)
         v = torch.randn(B, H, L, D, device="cuda", dtype=dtype)
 
-        t_pre = cuda_time(lambda: api.preprocess_qkv(q, k, v, True))
-        qq, kk, vv, qm, km, ds = api.preprocess_qkv(q, k, v, True)
-        t_q = cuda_time(lambda: api.scale_and_quant_fp4(qq, qm))
-        ql = api.scale_and_quant_fp4(qq, qm)
-        t_k = cuda_time(lambda: api.scale_and_quant_fp4_permute(kk, km))
-        kl = api.scale_and_quant_fp4_permute(kk, km)
-        t_v = cuda_time(lambda: api.scale_and_quant_fp4_transpose(vv))
-        vl = api.scale_and_quant_fp4_transpose(vv)
-        t_attn = cuda_time(lambda: api.blockscaled_fp4_attn(ql, kl, vl, ds, L, False, True, True))
-        total = t_pre + t_q + t_k + t_v + t_attn
+        t_km = cuda_time(lambda: k.mean(dim=-2, keepdim=True))
+        km = k.mean(dim=-2, keepdim=True)
+        t_pad = cuda_time(lambda: api._pad_128(q))
+        qp, kp, vp = map(api._pad_128, [q, k, v])
+        t_q = cuda_time(lambda: api.scale_and_quant_fp4_block_mean(qp))
+        q_fp4, q_sf, qm = api.scale_and_quant_fp4_block_mean(qp)
+        t_ds = cuda_time(lambda: torch.matmul(qm, kp.transpose(-2, -1)))
+        delta_s = torch.matmul(qm, kp.transpose(-2, -1))
+        t_k = cuda_time(lambda: api.scale_and_quant_fp4_permute(kp, km))
+        klist = api.scale_and_quant_fp4_permute(kp, km)
+        t_v = cuda_time(lambda: api.scale_and_quant_fp4_transpose(vp))
+        vlist = api.scale_and_quant_fp4_transpose(vp)
+        t_attn = cuda_time(lambda: api.blockscaled_fp4_attn((q_fp4, q_sf), klist, vlist, delta_s, L, False, True, True))
+        total = t_km + t_pad + t_q + t_ds + t_k + t_v + t_attn
         print(f"shape {(B,H,L,D)}  total {total:.2f} ms  (attn kernel {t_attn:.2f} ms = {100*t_attn/total:.0f}%)")
-        print(f"  preprocess {t_pre*1e3:8.1f}us  quantQ {t_q*1e3:7.1f}us  quantK {t_k*1e3:7.1f}us  quantV {t_v*1e3:7.1f}us")
-        t_mean = cuda_time(lambda: k.mean(dim=-2, keepdim=True))
-        t_ds = cuda_time(lambda: torch.matmul(qm, k.transpose(-2, -1)))
-        t_dsf = cuda_time(lambda: ds.to(torch.float32).contiguous())
-        t_pad = cuda_time(lambda: q.contiguous())
-        print(f"  [parts] k.mean {t_mean*1e3:.1f}us | delta_s matmul {t_ds*1e3:.1f}us | "
-              f"delta_s->f32 {t_dsf*1e3:.1f}us | q.contiguous {t_pad*1e3:.1f}us")
-        del q, k, v, qq, kk, vv
+        print(f"  k.mean {t_km*1e3:6.1f}us | pad {t_pad*1e3:5.1f}us | quantQ+qm {t_q*1e3:6.1f}us | "
+              f"delta_s mm {t_ds*1e3:6.1f}us | quantK {t_k*1e3:6.1f}us | quantV {t_v*1e3:6.1f}us")
+        del q, k, v, qp, kp, vp, q_fp4, q_sf, qm, delta_s, klist, vlist
         torch.cuda.empty_cache()
 
 
