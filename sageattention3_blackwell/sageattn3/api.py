@@ -22,6 +22,15 @@ from torch.nn.functional import scaled_dot_product_attention as sdpa
 import fp4attn_cuda
 import fp4quant_cuda
 
+# GB10 (sm_121) notes, see GB10_PORTING.md §2.2/2.6:
+#   * The mean subtraction for Q (per 128-token block) and K (whole sequence) is
+#     fused into the FP4 quantizers, so `q - qm` / `k - km` are never materialised
+#     (that saves a full read+write pass over each tensor on a 220 GB/s part).
+#   * `delta_s` stays in the input dtype (bf16/fp16); the fwd kernel now consumes
+#     16-bit bias tiles, and the `qm @ km^T` term is dropped because it is a
+#     per-row constant that cancels inside softmax (this kernel returns no lse).
+
+
 
 @triton.jit
 def group_mean_kernel(

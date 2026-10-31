@@ -58,11 +58,14 @@ void transpose_pad_permute_cuda(
                 torch::Tensor output,
                 int tensor_layout);
 
+// GB10: per-(batch, head, channel) amax of V; one DRAM pass, coalesced.
 void channel_amax_cuda(
                 torch::Tensor input,
                 torch::Tensor amax,
                 int tensor_layout);
 
+// GB10: transpose/pad/permute + per-channel FP8 quantization in one kernel,
+// using the amax from channel_amax_cuda (bit-identical to the two-step path).
 void transpose_pad_permute_quant_cuda(
                 torch::Tensor input,
                 torch::Tensor output,
@@ -86,6 +89,11 @@ void mean_scale_fuse_quant_cuda(
                 int num_tokens,
                 float scale_max,
                 int tensor_layout);
+
+// GB10: one launch, two phases - column-sum the K mean, then per-64-token int8
+// quantize with that mean subtracted.  The quantize pass re-reads the head from
+// L2; identical output to "k.mean() + quant_per_block_int8_fuse_sub_mean".
+// lag: 1 overlaps reduce(h+1) with quantize(h), 0 is strictly per head.
 void mean_quant_per_block_int8_cuda(
                 torch::Tensor input,
                 torch::Tensor km_out,
@@ -95,6 +103,7 @@ void mean_quant_per_block_int8_cuda(
                 int lag,
                 int red_tokens);
 
+// GB10: one launch - per-channel amax of V, then transpose/pad/permute + FP8.
 void amax_transpose_pad_permute_quant_cuda(
                 torch::Tensor input,
                 torch::Tensor output,

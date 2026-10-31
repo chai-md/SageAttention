@@ -47,7 +47,9 @@ if not SKIP_CUDA_BUILD:
     # Supported NVIDIA GPU architectures.
     SUPPORTED_ARCHS = {"8.0", "8.6", "8.9", "9.0", "10.0", "12.0", "12.1"}
 
-    # Compiler flags.
+    # Compiler flags.  -std=c++20 (upstream ships c++17): this tree is built on the
+    # GB10/sm_121 toolchain (CUDA 13.0 + torch 2.15 headers), where c++20 is what
+    # compiles cleanly; everything in csrc/ is valid c++17 as well.
     CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++20", "-DENABLE_BF16"]
     NVCC_FLAGS = [
         "-O3",

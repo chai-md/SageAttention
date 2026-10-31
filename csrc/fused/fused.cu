@@ -25,6 +25,17 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+// GB10 (sm_121) additions, see GB10_PORTING.md §2.4/2.7:
+//   ChannelAmaxKernel + TransposePadPermuteQuantKernel
+//       V quantization in two DRAM passes (no FP16 transpose round trip).
+//   L2ReduceQuantKernel
+//       Fuses "reduce then quantize" (K: mean + int8, V: amax + fp8) into one
+//       launch and re-reads each head from L2 (one head fits in GB10's 24 MB).
+//       CTAs take tickets from an atomic counter, so a quantize CTA only ever
+//       waits on reduce CTAs that already hold smaller tickets (no deadlock).
+//   Everything here is bit-identical to the separate-kernel path; the Python
+//   side selects between them with SAGEATTN_L2_FUSED.
+
 enum class QuantType
 {
   kInt8,

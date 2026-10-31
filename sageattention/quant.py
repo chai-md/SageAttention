@@ -20,6 +20,13 @@ from typing import Any, List, Literal, Optional, Tuple, Union
 
 from . import _fused
 
+# GB10 (sm_121) additions in this file, see GB10_PORTING.md:
+#   per_channel_fp8(smooth_v=False)  ->  channel_amax_cuda + transpose_pad_permute_quant_cuda,
+#       i.e. two DRAM passes over V instead of three (bit-identical output).
+#   per_warp_int8_smooth_k()         ->  K mean + K int8 quantization in one launch.
+#   L2_FUSED / L2_LAG / L2_RED_TOKENS gate the fused kernels on the C++ side
+#   (SAGEATTN_L2_FUSED=0 restores the separate-kernel path).
+
 # Single-launch "reduce then quantize" kernels that re-read each head from L2
 # instead of DRAM (K mean + K int8, V amax + V fp8).  Set SAGEATTN_L2_FUSED=0
 # to fall back to the separate reduction / quantization kernels.

@@ -85,6 +85,8 @@ if not SKIP_CUDA_BUILD:
             ["git", "clone", "--depth", "1", "https://github.com/NVIDIA/cutlass.git", str(cutlass_dir)],
             check=True
         )
+    # Compiler flags.  -std=c++20 (upstream ships c++17) for the GB10/sm_121
+    # toolchain (CUDA 13.0 + torch 2.15 headers); CUTLASS compiles fine either way.
     nvcc_flags = [
         "-O3",
         # "-O0",
