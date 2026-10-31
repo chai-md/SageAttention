@@ -161,7 +161,38 @@ k.mean 0.46 / qm 0.43 / quant Q+K+V 1.69。
 
 ---
 
-## 8. エージェントに渡すときのプロンプト例
+## 8. 外部エージェントにレビューさせる手順（実績あり）
+
+2026-10-31 に Claude Code で 2 回、Antigravity で 1 回試した。再現手順:
+
+```bash
+# 1. レビュー用の worktree を切る（メインの作業ツリーを汚さない）
+git -C /home/chai/SageAttention worktree add -b review-X /home/chai/worktrees/sa-X gb10-sm121
+
+# 2. ブリーフを置く（reviews/briefs/ に実例: sa3.md, sa2.md）
+#    - GB10 の roofline 実測値 / 既にやった最適化 / 触ってよい範囲 /
+#      ビルドと計測のコマンド / 受け入れ条件（cos の下限と目標 ms）/ 報告先
+cp reviews/briefs/sa3.md /home/chai/worktrees/sa-X/BRIEF.md
+
+# 3. SA3 を触らせる場合は CUTLASS を共有（230MB の二重 clone を避ける）
+mkdir -p /home/chai/worktrees/sa-X/sageattention3_blackwell/csrc
+ln -sfn /home/chai/SageAttention/sageattention3_blackwell/csrc/cutlass \
+        /home/chai/worktrees/sa-X/sageattention3_blackwell/csrc/cutlass
+
+# 4. 実行（エージェントには build_ext --inplace だけを使わせる）
+cd /home/chai/worktrees/sa-X && claude -p "Read BRIEF.md and execute it" \
+  --allowedTools 'Read,Edit,Write,Bash' --max-turns 100 --model opus
+#   計測は必ず "cd /tmp && PYTHONPATH=<worktree> python bench/bench_gb10.py ..."
+```
+
+**共有 venv に `pip/uv install` させない**（並行作業が壊れる）。`setup.py build_ext --inplace` +
+`PYTHONPATH` で分離できる。ブリーフには「試して失敗した実験」も書くこと（同じ罠を踏む）。
+
+* Claude Code: `claude -p` の print モードで完走（--output-format json で結果が取れる）。
+* Antigravity (`agy -p`): 2026-10-31 は **Individual quota (429)** で 16 分地点で停止。
+  部分的な変更は未検証なので破棄した（`reviews/briefs/sa2-agy-attempt.md` に当時のブリーフ）。
+
+## 9. エージェントに渡すときのプロンプト例
 
 ```
 /home/chai/SageAttention のブランチ gb10-sm121 で作業を続けてください。
