@@ -167,9 +167,13 @@ __global__ void scaled_fp4_quant_kernel(
     int stride_bz_input, int stride_h_input, int stride_seq_input,
     int stride_bz_output, int stride_h_output, int stride_seq_output,
     int stride_bz_output_sf, int stride_h_output_sf, int stride_seq_output_sf,
-    const T* mean = nullptr, int stride_bz_mean = 0, int stride_h_mean = 0, int mean_group_stride = 0) {
+    const T* mean = nullptr, int stride_bz_mean = 0, int stride_h_mean = 0, int mean_group_stride = 0,
+    T* mean_out = nullptr) {
   static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 input are supported");
   using PackedVec = PackedVec<T>;
+  // mean_out != nullptr: compute the per-block (BLOCK_SIZE-token) mean in-kernel,
+  // write it to mean_out (same strides as `mean`) and subtract it.  This replaces
+  // the separate host-side `q.view(...).mean(-2)` pass over Q.
 
   const int batch_id = blockIdx.y;
   const int head_id = blockIdx.z;
@@ -226,7 +230,54 @@ __global__ void scaled_fp4_quant_kernel(
     }
   }
 
-  if (mean != nullptr && load_token_id < num_tokens) {
+  if (mean_out != nullptr) {
+    // Block-wide column sum over the BLOCK_SIZE tokens of this block.
+    constexpr int NUM_WARPS = BLOCK_SIZE * NUM_THREADS_PER_TOKEN / 32;
+    __shared__ float s_partial[NUM_WARPS][head_dim];
+    __shared__ float s_mean[head_dim];
+    float sum[CVT_FP4_ELTS_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+      sum[2 * i] = fp2Vals[i].x;
+      sum[2 * i + 1] = fp2Vals[i].y;
+    }
+    #pragma unroll
+    for (int off = NUM_THREADS_PER_TOKEN; off < 32; off <<= 1) {
+      #pragma unroll
+      for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD; i++) {
+        sum[i] += __shfl_xor_sync(0xffffffffu, sum[i], off);
+      }
+    }
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    if (lane < NUM_THREADS_PER_TOKEN) {
+      #pragma unroll
+      for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD; i++) {
+        s_partial[warp][lane * CVT_FP4_ELTS_PER_THREAD + i] = sum[i];
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x < head_dim) {
+      float acc = 0.f;
+      #pragma unroll
+      for (int w = 0; w < NUM_WARPS; w++) acc += s_partial[w][threadIdx.x];
+      // round to the storage dtype so the subtracted mean is exactly the one
+      // used by the delta_s matmul on the host
+      const T m = static_cast<T>(acc / float(BLOCK_SIZE));
+      mean_out[batch_id * stride_bz_mean + head_id * stride_h_mean +
+               token_block_id * mean_group_stride + threadIdx.x] = m;
+      s_mean[threadIdx.x] = static_cast<float>(m);
+    }
+    __syncthreads();
+    if (load_token_id < num_tokens) {
+      const int c0 = (threadIdx.x % NUM_THREADS_PER_TOKEN) * CVT_FP4_ELTS_PER_THREAD;
+      #pragma unroll
+      for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+        fp2Vals[i].x -= s_mean[c0 + 2 * i];
+        fp2Vals[i].y -= s_mean[c0 + 2 * i + 1];
+      }
+    }
+  } else if (mean != nullptr && load_token_id < num_tokens) {
     const PackedVec mean_vec = *reinterpret_cast<PackedVec const*>(
         mean + batch_id * stride_bz_mean +
         head_id * stride_h_mean +
@@ -443,8 +494,10 @@ void scaled_fp4_quant(torch::Tensor const& input,
                             torch::Tensor const& output,
                             torch::Tensor const& output_sf,
                             int tensor_layout,
-                            c10::optional<torch::Tensor> mean = c10::nullopt) {
+                            c10::optional<torch::Tensor> mean = c10::nullopt,
+                            c10::optional<torch::Tensor> mean_out = c10::nullopt) {
   constexpr int BLOCK_SIZE = 128;
+  TORCH_CHECK(!(mean.has_value() && mean_out.has_value()), "pass either mean or mean_out, not both");
   
   CHECK_CUDA(input);
   CHECK_CUDA(output);
@@ -499,7 +552,14 @@ void scaled_fp4_quant(torch::Tensor const& input,
 
   auto input_dtype = input.scalar_type();
   auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-  const MeanArgs mean_args = resolve_mean(mean, input);
+  const MeanArgs mean_args = resolve_mean(mean_out.has_value() ? mean_out : mean, input);
+  if (mean_out.has_value()) {
+    TORCH_CHECK(tensor_layout == 1, "mean_out requires tensor_layout == 1 ([B, H, L, D])");
+    TORCH_CHECK(mean_out->size(1) == num_heads &&
+                mean_out->size(2) == (num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE,
+                "mean_out must be [batch, heads, ceil(tokens / 128), head_dim]");
+  }
+  void *mean_out_ptr = mean_out.has_value() ? mean_out->data_ptr() : nullptr;
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
@@ -515,8 +575,9 @@ void scaled_fp4_quant(torch::Tensor const& input,
               stride_bz_input, stride_h_input, stride_seq_input,
               stride_bz_output, stride_h_output, stride_seq_output,
               stride_bz_output_sf, stride_h_output_sf, stride_seq_output_sf,
-              reinterpret_cast<const c_type*>(mean_args.ptr),
-              mean_args.stride_bz, mean_args.stride_h, mean_args.group_stride);
+              mean_out_ptr ? nullptr : reinterpret_cast<const c_type*>(mean_args.ptr),
+              mean_args.stride_bz, mean_args.stride_h, mean_args.group_stride,
+              reinterpret_cast<c_type*>(mean_out_ptr));
     });
   });
 }
@@ -686,7 +747,8 @@ void scaled_fp4_quant_trans(torch::Tensor const& input,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("scaled_fp4_quant", &scaled_fp4_quant,
         pybind11::arg("input"), pybind11::arg("output"), pybind11::arg("output_sf"),
-        pybind11::arg("tensor_layout"), pybind11::arg("mean") = pybind11::none());
+        pybind11::arg("tensor_layout"), pybind11::arg("mean") = pybind11::none(),
+        pybind11::arg("mean_out") = pybind11::none());
   m.def("scaled_fp4_quant_permute", &scaled_fp4_quant_permute,
         pybind11::arg("input"), pybind11::arg("output"), pybind11::arg("output_sf"),
         pybind11::arg("tensor_layout"), pybind11::arg("mean") = pybind11::none());

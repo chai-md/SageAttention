@@ -237,6 +237,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(delta_s.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(delta_s.scalar_type() == (is_bf16 ? at::ScalarType::BFloat16 : at::ScalarType::Half),
+                "delta_s must be bf16/fp16 matching the output dtype");
 
     TORCH_CHECK(q.is_contiguous(), "Input tensor must be contiguous");
     TORCH_CHECK(k.is_contiguous(), "Input tensor must be contiguous");

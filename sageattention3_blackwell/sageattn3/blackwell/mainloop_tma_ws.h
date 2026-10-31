@@ -51,6 +51,7 @@ struct CollectiveMainloopFwd {
     using SmemLayoutV = typename Ktraits::SmemLayoutV;
     using SmemLayoutVt = typename Ktraits::SmemLayoutVt;
     using SmemLayoutDS = typename Ktraits::SmemLayoutDS;
+    using ElementDS = typename Ktraits::ElementDS;
     using SmemLayoutAtomDS = typename Ktraits::SmemLayoutAtomDS;
     using LayoutDS = decltype(
         blocked_product(
@@ -90,7 +91,7 @@ struct CollectiveMainloopFwd {
     
     using TMA_DS = decltype(make_tma_copy(
         GmemTiledCopy{},
-        make_tensor(make_gmem_ptr(static_cast<float const*>(nullptr)), LayoutDS{}),
+        make_tensor(make_gmem_ptr(static_cast<ElementDS const*>(nullptr)), LayoutDS{}),
         take<0, 2>(SmemLayoutDS{}),
         make_shape(shape<0>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
         _1{}));
@@ -145,7 +146,7 @@ struct CollectiveMainloopFwd {
     
     static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(
         cutlass::bits_to_bytes(cosize(take<0,2>(SmemLayoutSFK{})) * cute::sizeof_bits_v<ElementSF>) +
-        cutlass::bits_to_bytes(cosize(take<0,2>(SmemLayoutDS{})) * cute::sizeof_bits_v<float>) +
+        cutlass::bits_to_bytes(cosize(take<0,2>(SmemLayoutDS{})) * cute::sizeof_bits_v<ElementDS>) +
         cutlass::bits_to_bytes(size(take<0,2>(SmemLayoutK{})) * sizeof_bits<Element>::value));
     
     static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(
@@ -170,7 +171,7 @@ struct CollectiveMainloopFwd {
         ShapeSF const shape_SFK{};
         ElementSF const* ptr_SFVt{nullptr};
         ShapeSF const shape_SFVt{};
-        float const* ptr_ds;
+        ElementDS const* ptr_ds;
         ShapeQKV const shape_ds;
         StrideQKV const stride_ds;
         float const softmax_scale_log2;
@@ -689,13 +690,18 @@ struct CollectiveMainloopFwd {
         //     cute::gemm(tiled_mma_pv, make_zip_tensor(tOrP(_, _, block_id), tOrSFP(_, _, block_id)), make_zip_tensor(tOrVt(_, _, block_id), tOrSFVt(_, _, block_id)), tOrO);
         // };
         auto add_delta_s = [&](auto& acc) {
-            auto tSsDS_stage = recast<float4>(sDS(_, _, smem_pipe_read_k.index()));
+            // delta_s is stored in 16-bit (bf16/fp16).  Each thread owns 8 contiguous
+            // columns per 32-column group: one 16-byte smem load -> two float4.
+            ElementDS const* ds_stage = &sDS(_0{}, _0{}, smem_pipe_read_k.index());
             auto acc_float4 = recast<float4>(acc);
-            int quad_id = (threadIdx.x % 4) * 2;
+            int const col0 = (threadIdx.x % 4) * 8;
+            cutlass::NumericArrayConverter<float, ElementDS, 8> cvt;
+            CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < 4; i++) {
-                auto num = quad_id + i * 8;
-                float4 delta_s_0 = tSsDS_stage(make_coord(_0{}, _0{}), make_coord(num, _0{}));
-                float4 delta_s_1 = tSsDS_stage(make_coord(_0{}, _0{}), make_coord(num + 1, _0{}));
+                uint4 raw = *reinterpret_cast<uint4 const*>(ds_stage + col0 + i * 32);
+                cutlass::Array<float, 8> f = cvt(reinterpret_cast<cutlass::Array<ElementDS, 8> const&>(raw));
+                float4 delta_s_0 = make_float4(f[0], f[1], f[2], f[3]);
+                float4 delta_s_1 = make_float4(f[4], f[5], f[6], f[7]);
                 acc_float4(make_coord(make_coord(_0{}, _0{}), _0{}), _0{}, i) = delta_s_0;
                 acc_float4(make_coord(make_coord(_0{}, _0{}), _1{}), _0{}, i) = delta_s_0;
                 acc_float4(make_coord(make_coord(_0{}, _1{}), _0{}), _0{}, i) = delta_s_1;

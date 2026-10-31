@@ -52,7 +52,9 @@ struct SharedStorageQKVOwithSF : cute::aligned_struct<128, _0>{
     cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFQ>> smem_SFQ;
     cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFK>> smem_SFK;
     cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFV>> smem_SFV;
-    alignas(1024) cute::ArrayEngine<float, cute::cosize_v<SmemLayoutDS>> smem_ds;
+    // delta_s bias tiles are kept in the input precision (bf16/fp16): the host
+    // matmul already rounds to that precision, so fp32 storage only doubled traffic.
+    alignas(1024) cute::ArrayEngine<OutputType, cute::cosize_v<SmemLayoutDS>> smem_ds;
     alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutV>> smem_v;
     alignas(1024) cute::ArrayEngine<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
     
@@ -148,7 +150,8 @@ struct Flash_fwd_kernel_traits {
     using SmemCopyAtomQ = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
     using SmemCopyAtomKV = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
     using SmemCopyAtomSF = Copy_Atom<UniversalCopy<ElementSF>, ElementSF>;
-    using SmemCopyAtomDS = Copy_Atom<UniversalCopy<float>, float>;
+    using ElementDS = ElementOut;
+    using SmemCopyAtomDS = Copy_Atom<UniversalCopy<ElementDS>, ElementDS>;
 
     using BlkScaledConfig = flash::BlockScaledConfig<SFVectorSize>;
     using LayoutSF = typename BlkScaledConfig::LayoutSF;
