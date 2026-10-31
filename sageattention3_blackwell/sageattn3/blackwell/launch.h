@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include <ATen/cuda/CUDAContext.h>
 
 #include "cute/tensor.hpp"
@@ -86,7 +88,21 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr int ctaSize = Kernel_traits::kNWarps * 32;
     params.m_block_divmod = cutlass::FastDivmod(num_blocks_m);
     params.total_blocks = num_blocks_m * params.h * params.b;
-    dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, 170);
+    // Persistent scheduler: one CTA per SM.  Never hard-code the SM count of a
+    // particular SKU (upstream assumed RTX 5090 = 170); query it from the device
+    // so sm_121 (GB10 = 48 SM) and any other Blackwell part size their grid right.
+    int num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    static const int sm_override = []() {
+        const char *env = std::getenv("SAGE3_NUM_SM");
+        return env ? std::atoi(env) : 0;
+    }();
+    if (sm_override > 0) {
+        num_sm = sm_override;
+    }
+    if (num_sm <= 0) {
+        num_sm = 1;
+    }
+    dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, num_sm);
     dim3 block_dims(ctaSize);
     dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
     cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};

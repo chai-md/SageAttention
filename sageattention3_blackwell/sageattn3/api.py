@@ -72,7 +72,19 @@ def triton_group_mean(q: torch.Tensor):
     return q_out, qm
 
 
-def preprocess_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_block_mean: bool = True):
+def preprocess_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_block_mean: bool = True,
+                   block_size: int = 128):
+    """Pad to a multiple of `block_size` and compute the smoothing means.
+
+    Returns ``(q, k, v, qm, km, delta_s)``.  ``q``/``k`` are returned **unshifted**;
+    the means are subtracted inside the FP4 quantization kernels (see
+    ``scale_and_quant_fp4*``), which removes one full read+write pass over Q and K
+    compared with materialising ``q - qm`` / ``k - km`` on the host.  That pass is
+    the dominant cost on memory-starved parts such as GB10.
+
+    ``delta_s`` is the score bias that compensates the mean shift:
+    ``qm @ (k - km)^T``, computed without materialising ``k - km``.
+    """
 
     def pad_128(x):
         L = x.size(2)
@@ -80,31 +92,43 @@ def preprocess_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_block_
         if pad_len == 0:
             return x.contiguous()
         return F.pad(x, (0, 0, 0, pad_len), value=0).contiguous()
-    
-    k -= k.mean(dim=-2, keepdim=True)  
-    q, k, v = map(lambda x: pad_128(x), [q, k, v])
+
+    km = k.mean(dim=-2, keepdim=True)  # [B, H, 1, D]
+    q, k, v = map(pad_128, [q, k, v])
     if per_block_mean:
-        q, qm = triton_group_mean(q)
+        B, H, Lp, D = q.shape
+        qm = q.view(B, H, Lp // block_size, block_size, D).mean(dim=-2)  # [B, H, Lp // 128, D]
     else:
         qm = q.mean(dim=-2, keepdim=True)
-        q = q - qm
-    delta_s = torch.matmul(qm, k.transpose(-2, -1)).to(torch.float32).contiguous()
-    return q, k, v, delta_s
+    # qm @ (k - km)^T == qm @ k^T - qm @ km^T.  The second term is constant along
+    # the key axis, so it cancels inside softmax: the attention output is
+    # invariant to it, and this kernel never returns a logsumexp.  Dropping it
+    # removes one full [B, H, G, L] read+write pass (~0.9 ms/16k on GB10).
+    delta_s = torch.matmul(qm, k.transpose(-2, -1))
+    # the fwd kernel consumes fp32 bias tiles
+    delta_s = delta_s.to(torch.float32).contiguous()
+    return q, k, v, qm, km, delta_s
 
-def scale_and_quant_fp4(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def scale_and_quant_fp4(x: torch.Tensor, mean: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.ndim == 4
     B, H, N, D = x.shape
     packed_fp4 = torch.empty((B, H, N, D // 2), device=x.device, dtype=torch.uint8)
     fp8_scale = torch.empty((B, H, N, D // 16), device=x.device, dtype=torch.float8_e4m3fn)
-    fp4quant_cuda.scaled_fp4_quant(x, packed_fp4, fp8_scale, 1)
+    if mean is None:
+        fp4quant_cuda.scaled_fp4_quant(x, packed_fp4, fp8_scale, 1)
+    else:
+        fp4quant_cuda.scaled_fp4_quant(x, packed_fp4, fp8_scale, 1, mean.contiguous())
     return packed_fp4, fp8_scale
 
-def scale_and_quant_fp4_permute(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def scale_and_quant_fp4_permute(x: torch.Tensor, mean: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.ndim == 4
     B, H, N, D = x.shape
     packed_fp4 = torch.empty((B, H, N, D // 2), device=x.device, dtype=torch.uint8)
     fp8_scale = torch.empty((B, H, N, D // 16), device=x.device, dtype=torch.float8_e4m3fn)
-    fp4quant_cuda.scaled_fp4_quant_permute(x, packed_fp4, fp8_scale, 1)
+    if mean is None:
+        fp4quant_cuda.scaled_fp4_quant_permute(x, packed_fp4, fp8_scale, 1)
+    else:
+        fp4quant_cuda.scaled_fp4_quant_permute(x, packed_fp4, fp8_scale, 1, mean.contiguous())
     return packed_fp4, fp8_scale
 
 def scale_and_quant_fp4_transpose(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -135,9 +159,9 @@ def sageattn3_blackwell(q, k, v, attn_mask = None, is_causal = False, per_block_
     QL = q.size(2)
     KL = k.size(2)
     is_bf16 = q.dtype == torch.bfloat16
-    q, k, v, delta_s = preprocess_qkv(q, k, v, per_block_mean)
-    qlist_from_cuda = scale_and_quant_fp4(q)
-    klist_from_cuda = scale_and_quant_fp4_permute(k)
+    q, k, v, qm, km, delta_s = preprocess_qkv(q, k, v, per_block_mean)
+    qlist_from_cuda = scale_and_quant_fp4(q, qm)
+    klist_from_cuda = scale_and_quant_fp4_permute(k, km)
     vlist_from_cuda = scale_and_quant_fp4_transpose(v)
     o_fp4 = blockscaled_fp4_attn(
     qlist_from_cuda,

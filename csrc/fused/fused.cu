@@ -197,6 +197,114 @@ __global__ void QuantInt8Kernel(T *__restrict__ input, T *__restrict__ mean, int
   }
 }
 
+template <uint32_t head_dim, uint32_t CTA_SIZE, typename T>
+__global__ void ChannelAmaxKernel(T *__restrict__ input, float *__restrict__ amax,
+                                  const uint32_t num_tokens, const uint32_t num_heads,
+                                  const uint32_t stride_bz_input, const uint32_t stride_seq_input, const uint32_t stride_h_input)
+{
+  // One thread per feature column: the reads of a warp are consecutive halves
+  // along head_dim, so each (b, h, d) column is streamed with fully coalesced
+  // sectors.  Blocks split the sequence; the per-column max is folded with an
+  // atomic max (values are non-negative, so the int bit pattern orders them).
+  const uint32_t c = threadIdx.x;
+  const uint32_t bh = blockIdx.y;
+  const uint32_t b = bh / num_heads;
+  const uint32_t h = bh - b * num_heads;
+
+  const uint32_t start = blockIdx.x * CTA_SIZE;
+  const uint32_t end = min(start + CTA_SIZE, num_tokens);
+  const T *p = input + b * stride_bz_input + h * stride_h_input + c;
+
+  float m0 = 0.0f, m1 = 0.0f, m2 = 0.0f, m3 = 0.0f;
+  uint32_t i = start;
+  for (; i + 3 < end; i += 4)
+  {
+    m0 = fmaxf(m0, fabsf(convert_to_float(p[(i + 0) * stride_seq_input])));
+    m1 = fmaxf(m1, fabsf(convert_to_float(p[(i + 1) * stride_seq_input])));
+    m2 = fmaxf(m2, fabsf(convert_to_float(p[(i + 2) * stride_seq_input])));
+    m3 = fmaxf(m3, fabsf(convert_to_float(p[(i + 3) * stride_seq_input])));
+  }
+  for (; i < end; i++)
+  {
+    m0 = fmaxf(m0, fabsf(convert_to_float(p[i * stride_seq_input])));
+  }
+
+  const float m = fmaxf(fmaxf(m0, m1), fmaxf(m2, m3));
+  atomicMax(reinterpret_cast<unsigned int *>(amax + (b * num_heads + h) * head_dim + c), __float_as_uint(m));
+}
+
+// Same layout work as TransposePadPermuteKernel, but the transposed tile is
+// scaled by the per-channel factor and written straight out as FP8.  This
+// removes the FP16 round trip (write + re-read of the whole tensor) that the
+// two-pass version needs on memory-bound devices.
+template <uint32_t head_dim, uint32_t CTA_SIZE, bool pad_zero = false, typename T>
+__global__ void TransposePadPermuteQuantKernel(T *__restrict__ input, int8_t *__restrict__ output, float *__restrict__ amax,
+                            const float scale_max, const uint32_t num_tokens,
+                            const uint32_t stride_bz_input, const uint32_t stride_seq_input, const uint32_t stride_h_input,
+                            const uint32_t stride_bz_output, const uint32_t stride_d_output, const uint32_t stride_h_output)
+{
+  static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 are supported");
+
+  constexpr uint32_t pack_size = 8; // float4 contains 8 half or 8 bfloat16
+  uint32_t num_threads_per_token = head_dim / pack_size;
+  uint32_t num_threads_per_cta = CTA_SIZE / pack_size;
+
+  uint32_t bx = blockIdx.x;
+  uint32_t head_id = blockIdx.y;
+  uint32_t batch_id = blockIdx.z;
+  uint32_t thread_id = threadIdx.x;
+
+  uint32_t thread_base_token = bx * CTA_SIZE + thread_id / num_threads_per_token;
+
+  T *input_ptr_base = input + batch_id * stride_bz_input + head_id * stride_h_input + thread_base_token * stride_seq_input + thread_id % num_threads_per_token * pack_size;
+  int8_t *output_ptr_base = output + batch_id * stride_bz_output + head_id * stride_h_output + bx * CTA_SIZE + thread_id % num_threads_per_cta * pack_size + thread_id / num_threads_per_cta * stride_d_output;
+
+  __shared__ T shared_load[CTA_SIZE][head_dim];
+  __shared__ T shared_store[head_dim][CTA_SIZE];
+
+  // 0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15
+  // permute on the seq dimension for fp8 mma
+  uint32_t smem_load_row_base = ((thread_id / num_threads_per_token) / 16) * 16;
+  uint32_t smem_load_row_mod = (thread_id / num_threads_per_token) % 16;
+  uint32_t smem_load_row = smem_load_row_base + (smem_load_row_mod / 8) * 2 + ((smem_load_row_mod / 2) % 4) * 4 + (smem_load_row_mod % 2);
+
+  constexpr cp_async::SharedMemFillMode fill_mode = pad_zero ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
+  cp_async::pred_load_128b<cp_async::PrefetchMode::kNoPrefetch, fill_mode>(shared_load[smem_load_row] + thread_id % num_threads_per_token * pack_size, input_ptr_base, thread_base_token < num_tokens);
+  cp_async::commit_group();
+  cp_async::wait_group<0>();
+  __syncthreads();
+
+  uint32_t smem_row_base = thread_id % CTA_SIZE;
+  uint32_t smem_col_base = thread_id / CTA_SIZE;
+  uint32_t smem_col_stride = head_dim / 8;
+
+  // TODO: use ldmatrix to do permutation
+#pragma unroll
+  for (uint32_t i = 0; i < 8; i++)
+  {
+    shared_store[smem_col_base + i * smem_col_stride][smem_row_base] = shared_load[smem_row_base][smem_col_base + i * smem_col_stride];
+  }
+
+  __syncthreads();
+
+  const uint32_t d_idx = thread_id / num_threads_per_cta;
+  const float amax_val = amax[(batch_id * gridDim.y + head_id) * head_dim + d_idx];
+  const float recp_scale = (amax_val > 0.0f) ? (scale_max / amax_val) : 0.0f;
+
+  T *src = &shared_store[d_idx][thread_id % num_threads_per_cta * pack_size];
+  float vals[8];
+#pragma unroll
+  for (uint32_t j = 0; j < 8; j++)
+  {
+    vals[j] = convert_to_float(src[j]) * recp_scale;
+  }
+  uint32_t packed[2];
+  floatx4_to_e4m3x4(packed, vals, vals + 2);
+  floatx4_to_e4m3x4(packed + 1, vals + 4, vals + 6);
+
+  *reinterpret_cast<uint2 *>(output_ptr_base) = *reinterpret_cast<uint2 *>(&packed[0]);
+}
+
 template <uint32_t head_dim, uint32_t BLOCK_SIZE, uint32_t num_pack_per_thread = 1, typename T>
 __global__ void SubMeanKernel(T *__restrict__ input, T *__restrict__ mean, half *__restrict__ output, const uint32_t num_tokens, 
                             const uint32_t stride_bz_input, const uint32_t stride_seq_input, const uint32_t stride_h_input,
@@ -917,6 +1025,128 @@ void transpose_pad_permute_cuda(
         num_tokens,
         stride_bz_input, stride_seq_input, stride_h_input,
         stride_bz_output, stride_d_output, stride_h_output
+      );
+    });
+  });
+}
+
+void channel_amax_cuda(
+                torch::Tensor input,
+                torch::Tensor amax,
+                int tensor_layout)
+{
+  CHECK_CUDA(input);
+  CHECK_CUDA(amax);
+  CHECK_LASTDIM_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(amax);
+  CHECK_DIMS(input, 4);
+  CHECK_DIMS(amax, 3);
+
+  constexpr int CTA_SIZE = 1024;
+
+  const int batch_size = input.size(0);
+  const int head_dim = input.size(3);
+
+  int num_tokens, num_heads;
+  int stride_seq_input, stride_h_input;
+  if (tensor_layout == 0)
+  {
+    num_tokens = input.size(1);
+    num_heads = input.size(2);
+    stride_seq_input = input.stride(1);
+    stride_h_input = input.stride(2);
+  }
+  else
+  {
+    num_tokens = input.size(2);
+    num_heads = input.size(1);
+    stride_seq_input = input.stride(2);
+    stride_h_input = input.stride(1);
+  }
+
+  CHECK_SHAPE(amax, batch_size, num_heads, head_dim);
+
+  auto input_dtype = input.scalar_type();
+  TORCH_CHECK(amax.scalar_type() == torch::kFloat, "amax must be float32");
+
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
+    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+      dim3 grid((num_tokens + CTA_SIZE - 1) / CTA_SIZE, num_heads * batch_size);
+      dim3 block(HEAD_DIM);
+      ChannelAmaxKernel<HEAD_DIM, CTA_SIZE, c_type><<<grid, block>>>(
+        reinterpret_cast<c_type*>(input.data_ptr()),
+        reinterpret_cast<float*>(amax.data_ptr()),
+        num_tokens, num_heads,
+        input.stride(0), stride_seq_input, stride_h_input
+      );
+    });
+  });
+}
+
+void transpose_pad_permute_quant_cuda(
+                torch::Tensor input,
+                torch::Tensor output,
+                torch::Tensor amax,
+                double scale_max,
+                int tensor_layout)
+{
+  CHECK_CUDA(input);
+  CHECK_CUDA(output);
+  CHECK_CUDA(amax);
+  CHECK_LASTDIM_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(output);
+  CHECK_CONTIGUOUS(amax);
+  CHECK_DIMS(input, 4);
+  CHECK_DIMS(output, 4);
+  CHECK_DIMS(amax, 3);
+
+  constexpr int CTA_SIZE = 64;
+
+  const int batch_size = input.size(0);
+  const int head_dim = input.size(3);
+
+  int num_tokens, padded_num_tokens, num_heads;
+  int stride_seq_input, stride_h_input, stride_d_output, stride_h_output;
+  if (tensor_layout == 0)
+  {
+    num_tokens = input.size(1);
+    num_heads = input.size(2);
+    stride_seq_input = input.stride(1);
+    stride_h_input = input.stride(2);
+    stride_d_output = output.stride(1);
+    stride_h_output = output.stride(2);
+    padded_num_tokens = (num_tokens + CTA_SIZE - 1) / CTA_SIZE * CTA_SIZE;
+    CHECK_SHAPE(output, batch_size, head_dim, num_heads, padded_num_tokens);
+  }
+  else
+  {
+    num_tokens = input.size(2);
+    num_heads = input.size(1);
+    stride_seq_input = input.stride(2);
+    stride_h_input = input.stride(1);
+    stride_d_output = output.stride(2);
+    stride_h_output = output.stride(1);
+    padded_num_tokens = (num_tokens + CTA_SIZE - 1) / CTA_SIZE * CTA_SIZE;
+    CHECK_SHAPE(output, batch_size, num_heads, head_dim, padded_num_tokens);
+  }
+
+  auto input_dtype = input.scalar_type();
+  TORCH_CHECK(output.scalar_type() == torch::kFloat8_e4m3fn ||
+              output.scalar_type() == torch::kChar ||
+              output.scalar_type() == torch::kByte, "output must be fp8(e4m3) or int8/uint8 storage");
+
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
+    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+      dim3 grid(padded_num_tokens / CTA_SIZE, num_heads, batch_size);
+      dim3 block(CTA_SIZE * (HEAD_DIM / 8));
+      TransposePadPermuteQuantKernel<HEAD_DIM, CTA_SIZE, true, c_type><<<grid, block>>>(
+        reinterpret_cast<c_type*>(input.data_ptr()),
+        reinterpret_cast<int8_t*>(output.data_ptr()),
+        reinterpret_cast<float*>(amax.data_ptr()),
+        static_cast<float>(scale_max),
+        num_tokens,
+        input.stride(0), stride_seq_input, stride_h_input,
+        output.stride(0), stride_d_output, stride_h_output
       );
     });
   });

@@ -271,13 +271,25 @@ def per_channel_fp8(
     if tensor_layout == "HND":
         b, h_kv, kv_len, head_dim = v.shape
         padded_len = (kv_len + 63) // 64 * 64
-        v_transposed_permutted = torch.empty((b, h_kv, head_dim, padded_len), dtype=v.dtype, device=v.device)
-
+        out_shape = (b, h_kv, head_dim, padded_len)
     elif tensor_layout == "NHD":
         b, kv_len, h_kv, head_dim = v.shape
         padded_len = (kv_len + 63) // 64 * 64
-        v_transposed_permutted = torch.empty((b, head_dim, h_kv, padded_len), dtype=v.dtype, device=v.device)
-    
+        out_shape = (b, head_dim, h_kv, padded_len)
+
+    if not smooth_v:
+        # Fused path: per-channel amax + transpose/pad/permute + FP8 conversion in
+        # two passes over V (vs three in the generic path, which materialises a
+        # transposed FP16 copy).  Saves ~40% of the DRAM traffic of this stage,
+        # which matters on bandwidth-starved parts (GB10: ~220 GB/s).
+        amax = torch.zeros((b, h_kv, head_dim), dtype=torch.float32, device=v.device)
+        _fused.channel_amax_cuda(v, amax, _tensor_layout)
+        v_fp8 = torch.empty(out_shape, dtype=torch.float8_e4m3fn, device=v.device)
+        _fused.transpose_pad_permute_quant_cuda(v, v_fp8, amax, scale_max, _tensor_layout)
+        return v_fp8, amax / scale_max, None
+
+    v_transposed_permutted = torch.empty(out_shape, dtype=v.dtype, device=v.device)
+
     _fused.transpose_pad_permute_cuda(v, v_transposed_permutted, _tensor_layout)
 
     v_fp8 = torch.empty(v_transposed_permutted.shape, dtype=torch.float8_e4m3fn, device=v.device)

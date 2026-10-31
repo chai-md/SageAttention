@@ -58,6 +58,18 @@ void transpose_pad_permute_cuda(
                 torch::Tensor output,
                 int tensor_layout);
 
+void channel_amax_cuda(
+                torch::Tensor input,
+                torch::Tensor amax,
+                int tensor_layout);
+
+void transpose_pad_permute_quant_cuda(
+                torch::Tensor input,
+                torch::Tensor output,
+                torch::Tensor amax,
+                double scale_max,
+                int tensor_layout);
+
 void scale_fuse_quant_cuda(
                 torch::Tensor input,
                 torch::Tensor output,
