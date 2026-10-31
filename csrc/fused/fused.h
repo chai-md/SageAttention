@@ -86,3 +86,20 @@ void mean_scale_fuse_quant_cuda(
                 int num_tokens,
                 float scale_max,
                 int tensor_layout);
+void mean_quant_per_block_int8_cuda(
+                torch::Tensor input,
+                torch::Tensor km_out,
+                torch::Tensor output,
+                torch::Tensor scale,
+                int tensor_layout,
+                int lag,
+                int red_tokens);
+
+void amax_transpose_pad_permute_quant_cuda(
+                torch::Tensor input,
+                torch::Tensor output,
+                torch::Tensor amax,
+                double scale_max,
+                int tensor_layout,
+                int lag,
+                int red_tokens);

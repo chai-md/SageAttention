@@ -31,5 +31,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("channel_amax_cuda", py::overload_cast<torch::Tensor, torch::Tensor, int>(&channel_amax_cuda), "channel_amax_cuda");
   m.def("transpose_pad_permute_quant_cuda", py::overload_cast<torch::Tensor, torch::Tensor, torch::Tensor, double, int>(&transpose_pad_permute_quant_cuda), "transpose_pad_permute_quant_cuda");
   m.def("scale_fuse_quant_cuda", py::overload_cast<torch::Tensor, torch::Tensor, torch::Tensor, int, float, int>(&scale_fuse_quant_cuda), "scale_fuse_quant_cuda");
+  m.def("mean_quant_per_block_int8_cuda", py::overload_cast<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int, int, int>(&mean_quant_per_block_int8_cuda), "mean_quant_per_block_int8_cuda");
+  m.def("amax_transpose_pad_permute_quant_cuda", py::overload_cast<torch::Tensor, torch::Tensor, torch::Tensor, double, int, int, int>(&amax_transpose_pad_permute_quant_cuda), "amax_transpose_pad_permute_quant_cuda");
   m.def("mean_scale_fuse_quant_cuda", py::overload_cast<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int, float, int>(&mean_scale_fuse_quant_cuda), "mean_scale_fuse_quant_cuda");
 }

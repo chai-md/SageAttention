@@ -305,6 +305,291 @@ __global__ void TransposePadPermuteQuantKernel(T *__restrict__ input, int8_t *__
   *reinterpret_cast<uint2 *>(output_ptr_base) = *reinterpret_cast<uint2 *>(&packed[0]);
 }
 
+// ---------------------------------------------------------------------------
+// L2-resident "reduce then quantize" kernels (GB10 / bandwidth-bound parts).
+//
+// Both K smoothing (mean over tokens, then per-block int8 with the mean
+// subtracted) and V quantization (per-channel amax, then transpose + fp8) need
+// a full reduction over the sequence before the quantize pass can start, so
+// the input is streamed from DRAM twice.  One head of K or V is only
+// kv_len * head_dim * 2 bytes (8.4 MB at 32k x 128), which fits in L2 (24 MB
+// on GB10), so if the quantize pass for a head runs right after that head's
+// reduction, its re-read is served by L2 instead of DRAM.
+//
+// A single launch does both phases.  Each CTA grabs a ticket from an atomic
+// counter (so tickets follow the order in which CTAs actually start) and the
+// ticket stream is laid out as
+//   lag 1: reduce(0) | reduce(1) quant(0) | reduce(2) quant(1) | ... | quant(BH-1)
+//   lag 0: reduce(0) quant(0) | reduce(1) quant(1) | ...
+// A quant CTA of head h only waits for the reduce CTAs of head h, which all
+// hold smaller tickets and never wait themselves, so the spin cannot deadlock.
+// lag 1 overlaps the reduce of head h+1 with the quant of head h (no idle
+// SMs) but keeps ~2.5 heads live in L2; lag 0 keeps ~1 head live, for long
+// sequences where a head is a large fraction of L2.
+//
+// The cross-CTA reduction is deterministic: every reduce CTA writes its
+// partial to a workspace slot and the last one to finish folds the slots in
+// index order.
+// ---------------------------------------------------------------------------
+constexpr uint32_t kL2QuantTokens = 64;  // tokens per quant CTA (= BLKK for K, CTA_SIZE for V)
+
+struct L2PhaseInfo
+{
+  bool is_reduce;
+  uint32_t bh;
+  uint32_t idx;
+};
+
+__device__ __forceinline__ L2PhaseInfo l2_phase_from_ticket(uint32_t t, uint32_t num_bh, uint32_t R, uint32_t Qn, uint32_t lag)
+{
+  L2PhaseInfo info;
+  if (lag == 0)
+  {
+    const uint32_t g = t / (R + Qn);
+    const uint32_t r = t - g * (R + Qn);
+    info.bh = g;
+    info.is_reduce = r < R;
+    info.idx = info.is_reduce ? r : r - R;
+    return info;
+  }
+  if (t < R)
+  {
+    info.is_reduce = true; info.bh = 0; info.idx = t;
+    return info;
+  }
+  const uint32_t u = t - R;
+  const uint32_t g = 1 + u / (R + Qn);
+  const uint32_t r = u - (g - 1) * (R + Qn);
+  if (g < num_bh && r < R)
+  {
+    info.is_reduce = true; info.bh = g; info.idx = r;
+  }
+  else
+  {
+    info.is_reduce = false; info.bh = g - 1; info.idx = (g < num_bh) ? r - R : r;
+  }
+  return info;
+}
+
+// IS_V == false: K path.  reduce = column sum -> km (T, like torch.mean),
+//                         quant  = per-64-token-block int8 of (k - km).
+// IS_V == true : V path.  reduce = column abs-max -> amax (fp32),
+//                         quant  = transpose/pad/permute + per-channel fp8.
+template <uint32_t head_dim, bool IS_V, typename T>
+__global__ void __launch_bounds__(head_dim * 8) L2ReduceQuantKernel(
+                            const T *__restrict__ input, int8_t *__restrict__ output,
+                            T *__restrict__ km_out, float *__restrict__ amax_out,
+                            float *__restrict__ k_scale,
+                            float *__restrict__ partial, int *__restrict__ ws,
+                            const float scale_max, const uint32_t num_tokens, const uint32_t num_heads,
+                            const uint32_t R, const uint32_t Qn, const uint32_t lag, const uint32_t red_tokens,
+                            const uint32_t stride_bz_input, const uint32_t stride_seq_input, const uint32_t stride_h_input,
+                            const uint32_t stride_bz_output, const uint32_t stride_x_output, const uint32_t stride_h_output,
+                            const uint32_t stride_bz_scale, const uint32_t stride_h_scale)
+{
+  static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 are supported");
+  constexpr uint32_t pack_size = 8;
+  constexpr uint32_t threads_per_token = head_dim / pack_size;
+  constexpr uint32_t num_threads = head_dim * 8;
+  constexpr uint32_t rows_per_iter = num_threads / threads_per_token;  // = 64
+  static_assert(rows_per_iter == kL2QuantTokens, "tile mismatch");
+
+  constexpr uint32_t smem_bytes = rows_per_iter * head_dim * sizeof(float);  // >= 2 * 64 * head_dim * sizeof(T)
+  __shared__ __align__(16) uint8_t smem[smem_bytes];
+  __shared__ uint32_t s_ticket;
+  __shared__ bool s_is_last;
+  __shared__ float s_amax;
+
+  const uint32_t tid = threadIdx.x;
+  const uint32_t num_bh = gridDim.x / (R + Qn);
+  int *ticket_ctr = ws;
+  int *done_ctr = ws + 1;
+  int *ready = ws + 1 + num_bh;
+
+  if (tid == 0)
+    s_ticket = atomicAdd(ticket_ctr, 1);
+  __syncthreads();
+  const L2PhaseInfo info = l2_phase_from_ticket(s_ticket, num_bh, R, Qn, lag);
+  const uint32_t b = info.bh / num_heads;
+  const uint32_t h = info.bh - b * num_heads;
+  const T *in_base = input + b * stride_bz_input + h * stride_h_input;
+  const uint32_t row = tid / threads_per_token;
+  const uint32_t col = (tid % threads_per_token) * pack_size;
+
+  if (info.is_reduce)
+  {
+    // ---- phase 1: column sum / abs-max over kL2RedTokens tokens ----
+    float acc[8];
+#pragma unroll
+    for (uint32_t j = 0; j < 8; j++) acc[j] = 0.0f;
+
+    const uint32_t start = info.idx * red_tokens;
+#pragma unroll 4
+    for (uint32_t it = 0; it < red_tokens / rows_per_iter; it++)
+    {
+      const uint32_t token = start + it * rows_per_iter + row;
+      if (token < num_tokens)
+      {
+        T x[8];
+        *(float4 *)(&x[0]) = __ldg((const float4 *)(in_base + token * stride_seq_input + col));
+#pragma unroll
+        for (uint32_t j = 0; j < 8; j++)
+        {
+          const float f = convert_to_float(x[j]);
+          if constexpr (IS_V) acc[j] = fmaxf(acc[j], fabsf(f));
+          else acc[j] += f;
+        }
+      }
+    }
+
+    float (*red)[head_dim] = reinterpret_cast<float (*)[head_dim]>(smem);
+#pragma unroll
+    for (uint32_t j = 0; j < 8; j++) red[row][col + j] = acc[j];
+    __syncthreads();
+
+    float *my_partial = partial + ((size_t)info.bh * R + info.idx) * head_dim;
+    if (tid < head_dim)
+    {
+      float v = 0.0f;
+      for (uint32_t r = 0; r < rows_per_iter; r++)
+      {
+        if constexpr (IS_V) v = fmaxf(v, red[r][tid]);
+        else v += red[r][tid];
+      }
+      my_partial[tid] = v;
+      __threadfence();
+    }
+    __syncthreads();
+    if (tid == 0)
+      s_is_last = (atomicAdd(done_ctr + info.bh, 1) == (int)R - 1);
+    __syncthreads();
+
+    if (s_is_last)
+    {
+      __threadfence();
+      if (tid < head_dim)
+      {
+        const float *p = partial + (size_t)info.bh * R * head_dim + tid;
+        float v = 0.0f;
+        for (uint32_t r = 0; r < R; r++)
+        {
+          const float x = __ldcg(p + (size_t)r * head_dim);
+          if constexpr (IS_V) v = fmaxf(v, x);
+          else v += x;
+        }
+        if constexpr (IS_V) amax_out[info.bh * head_dim + tid] = v;
+        else km_out[info.bh * head_dim + tid] = convert_from_float<T>(v * (1.0f / (float)num_tokens));
+        __threadfence();
+      }
+      __syncthreads();
+      if (tid == 0)
+        atomicExch(ready + info.bh, 1);
+    }
+    return;
+  }
+
+  // ---- phase 2: wait for this head's reduction, then quantize a 64-token tile ----
+  if (tid == 0)
+  {
+    volatile int *flag = ready + info.bh;
+    while (*flag == 0) __nanosleep(64);
+    __threadfence();
+  }
+  __syncthreads();
+
+  if constexpr (!IS_V)
+  {
+    // same math as QuantInt8Kernel<head_dim, 64, 1, false, /*sub_mean=*/true>
+    const uint32_t token = info.idx * kL2QuantTokens + row;
+    T mean_val[8];
+    *(int4 *)(&mean_val[0]) = __ldcg((const int4 *)(km_out + info.bh * head_dim + col));
+
+    float xf[8];
+    if (token < num_tokens)
+    {
+      T x[8];
+      *(float4 *)(&x[0]) = *(const float4 *)(in_base + token * stride_seq_input + col);
+#pragma unroll
+      for (uint32_t j = 0; j < 8; j++) xf[j] = convert_to_float(x[j]) - convert_to_float(mean_val[j]);
+    }
+    else
+    {
+#pragma unroll
+      for (uint32_t j = 0; j < 8; j++) xf[j] = 0.0f;
+    }
+
+    float amax_val = 0.0000001f;
+#pragma unroll
+    for (uint32_t j = 0; j < 8; j++) amax_val = fmaxf(amax_val, fabsf(xf[j]));
+    const float block_amax_val = vllm::blockReduceMax(amax_val);
+    if (tid == 0)
+    {
+      s_amax = block_amax_val;
+      k_scale[b * stride_bz_scale + h * stride_h_scale + info.idx] = s_amax / 127.0f;
+    }
+    __syncthreads();
+    const float tmp_scale = 127.0f / s_amax;
+
+    char4 o_val[2];
+#pragma unroll
+    for (uint32_t j = 0; j < 2; j++)
+    {
+      o_val[j] = make_char4(
+        float_to_int8_rn(xf[j * 4 + 0] * tmp_scale),
+        float_to_int8_rn(xf[j * 4 + 1] * tmp_scale),
+        float_to_int8_rn(xf[j * 4 + 2] * tmp_scale),
+        float_to_int8_rn(xf[j * 4 + 3] * tmp_scale));
+    }
+    if (token < num_tokens)
+    {
+      int8_t *out = output + b * stride_bz_output + h * stride_h_output + token * stride_x_output + col;
+      *reinterpret_cast<float2 *>(out) = *reinterpret_cast<float2 *>(&o_val[0]);
+    }
+  }
+  else
+  {
+    // same math as TransposePadPermuteQuantKernel<head_dim, 64, /*pad_zero=*/true>
+    constexpr uint32_t CTA_SIZE = kL2QuantTokens;
+    constexpr uint32_t num_threads_per_cta = CTA_SIZE / pack_size;
+    T (*shared_load)[head_dim] = reinterpret_cast<T (*)[head_dim]>(smem);
+    T (*shared_store)[CTA_SIZE] = reinterpret_cast<T (*)[CTA_SIZE]>(smem + CTA_SIZE * head_dim * sizeof(T));
+
+    const uint32_t token = info.idx * CTA_SIZE + row;
+    const uint32_t smem_load_row = (row / 16) * 16 + ((row % 16) / 8) * 2 + (((row % 16) / 2) % 4) * 4 + (row % 2);
+    cp_async::pred_load_128b<cp_async::PrefetchMode::kNoPrefetch, cp_async::SharedMemFillMode::kFillZero>(
+        shared_load[smem_load_row] + col, in_base + token * stride_seq_input + col, token < num_tokens);
+    cp_async::commit_group();
+    cp_async::wait_group<0>();
+    __syncthreads();
+
+    const uint32_t smem_row_base = tid % CTA_SIZE;
+    const uint32_t smem_col_base = tid / CTA_SIZE;
+    constexpr uint32_t smem_col_stride = head_dim / 8;
+#pragma unroll
+    for (uint32_t i = 0; i < 8; i++)
+    {
+      shared_store[smem_col_base + i * smem_col_stride][smem_row_base] = shared_load[smem_row_base][smem_col_base + i * smem_col_stride];
+    }
+    __syncthreads();
+
+    const uint32_t d_idx = tid / num_threads_per_cta;
+    const float amax_val = __ldcg(amax_out + info.bh * head_dim + d_idx);
+    const float recp_scale = (amax_val > 0.0f) ? (scale_max / amax_val) : 0.0f;
+
+    const T *src = &shared_store[d_idx][tid % num_threads_per_cta * pack_size];
+    float vals[8];
+#pragma unroll
+    for (uint32_t j = 0; j < 8; j++) vals[j] = convert_to_float(src[j]) * recp_scale;
+    uint32_t packed[2];
+    floatx4_to_e4m3x4(packed, vals, vals + 2);
+    floatx4_to_e4m3x4(packed + 1, vals + 4, vals + 6);
+
+    int8_t *out = output + b * stride_bz_output + h * stride_h_output + info.idx * CTA_SIZE
+                  + tid % num_threads_per_cta * pack_size + d_idx * stride_x_output;
+    *reinterpret_cast<uint2 *>(out) = *reinterpret_cast<uint2 *>(&packed[0]);
+  }
+}
+
 template <uint32_t head_dim, uint32_t BLOCK_SIZE, uint32_t num_pack_per_thread = 1, typename T>
 __global__ void SubMeanKernel(T *__restrict__ input, T *__restrict__ mean, half *__restrict__ output, const uint32_t num_tokens, 
                             const uint32_t stride_bz_input, const uint32_t stride_seq_input, const uint32_t stride_h_input,
@@ -1310,4 +1595,127 @@ void mean_scale_fuse_quant_cuda(
       scale.stride(0), scale.stride(1)
     );
   });
+}
+
+// Launch helper shared by the K and V entry points of L2ReduceQuantKernel.
+template <bool IS_V>
+static void launch_l2_reduce_quant(torch::Tensor input, torch::Tensor output,
+                                   torch::Tensor km_out, torch::Tensor amax_out, torch::Tensor scale,
+                                   float scale_max, int tensor_layout, int lag, int red_tokens,
+                                   int64_t stride_bz_output, int64_t stride_x_output, int64_t stride_h_output)
+{
+  const int batch_size = input.size(0);
+  const int head_dim = input.size(3);
+  const int num_tokens = tensor_layout == 0 ? input.size(1) : input.size(2);
+  const int num_heads = tensor_layout == 0 ? input.size(2) : input.size(1);
+  const int stride_seq_input = tensor_layout == 0 ? input.stride(1) : input.stride(2);
+  const int stride_h_input = tensor_layout == 0 ? input.stride(2) : input.stride(1);
+
+  const uint32_t num_bh = batch_size * num_heads;
+  if (red_tokens <= 0) red_tokens = 1024;
+  TORCH_CHECK(red_tokens % 64 == 0, "red_tokens must be a multiple of 64");
+  if (lag < 0)
+  {
+    // lag 1 keeps ~2.5 heads of input live in L2; fall back to lag 0 when that does not fit.
+    const int64_t head_bytes = (int64_t)num_tokens * head_dim * input.element_size();
+    const int64_t l2_bytes = at::cuda::getCurrentDeviceProperties()->l2CacheSize;
+    lag = (3 * head_bytes <= l2_bytes) ? 1 : 0;
+  }
+  TORCH_CHECK(lag == 0 || lag == 1, "lag must be 0 or 1");
+  const uint32_t R = (num_tokens + red_tokens - 1) / red_tokens;
+  const uint32_t Qn = (num_tokens + kL2QuantTokens - 1) / kL2QuantTokens;
+  TORCH_CHECK((uint64_t)num_bh * (R + Qn) < (1ull << 31), "grid too large");
+
+  auto ws = torch::zeros({1 + 2 * (int64_t)num_bh}, input.options().dtype(torch::kInt));
+  auto partial = torch::empty({(int64_t)num_bh, (int64_t)R, head_dim}, input.options().dtype(torch::kFloat));
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, {
+    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+      dim3 grid(num_bh * (R + Qn));
+      dim3 block(HEAD_DIM * 8);
+      L2ReduceQuantKernel<HEAD_DIM, IS_V, c_type><<<grid, block, 0, stream>>>(
+        reinterpret_cast<const c_type*>(input.data_ptr()),
+        reinterpret_cast<int8_t*>(output.data_ptr()),
+        IS_V ? nullptr : reinterpret_cast<c_type*>(km_out.data_ptr()),
+        IS_V ? reinterpret_cast<float*>(amax_out.data_ptr()) : nullptr,
+        IS_V ? nullptr : reinterpret_cast<float*>(scale.data_ptr()),
+        partial.data_ptr<float>(), ws.data_ptr<int>(),
+        scale_max, num_tokens, num_heads, R, Qn, (uint32_t)lag, (uint32_t)red_tokens,
+        input.stride(0), stride_seq_input, stride_h_input,
+        stride_bz_output, stride_x_output, stride_h_output,
+        IS_V ? 0 : scale.stride(0), IS_V ? 0 : scale.stride(1)
+      );
+    });
+  });
+}
+
+// K smoothing + per-block (BLKK = 64) int8 quantization in one launch.
+// km_out: [b, h_kv, head_dim] in the dtype of `input` (== k.mean(seq)).
+void mean_quant_per_block_int8_cuda(
+                torch::Tensor input,
+                torch::Tensor km_out,
+                torch::Tensor output,
+                torch::Tensor scale,
+                int tensor_layout,
+                int lag,
+                int red_tokens)
+{
+  CHECK_CUDA(input); CHECK_CUDA(km_out); CHECK_CUDA(output); CHECK_CUDA(scale);
+  CHECK_DTYPE(output, torch::kInt8);
+  CHECK_DTYPE(scale, torch::kFloat);
+  CHECK_LASTDIM_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(km_out); CHECK_CONTIGUOUS(output); CHECK_CONTIGUOUS(scale);
+  CHECK_DIMS(input, 4); CHECK_DIMS(km_out, 3); CHECK_DIMS(output, 4); CHECK_DIMS(scale, 3);
+  TORCH_CHECK(km_out.scalar_type() == input.scalar_type(), "km_out must have the dtype of input");
+
+  const int num_tokens = tensor_layout == 0 ? input.size(1) : input.size(2);
+  const int num_heads = tensor_layout == 0 ? input.size(2) : input.size(1);
+  CHECK_SHAPE(km_out, input.size(0), num_heads, input.size(3));
+  CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
+  CHECK_SHAPE(scale, input.size(0), num_heads, (num_tokens + kL2QuantTokens - 1) / kL2QuantTokens);
+
+  launch_l2_reduce_quant<false>(input, output, km_out, torch::Tensor(), scale, 0.0f, tensor_layout, lag, red_tokens,
+                                output.stride(0),
+                                tensor_layout == 0 ? output.stride(1) : output.stride(2),
+                                tensor_layout == 0 ? output.stride(2) : output.stride(1));
+}
+
+// Per-channel amax + transpose/pad/permute + fp8 quantization in one launch.
+// Output identical to channel_amax_cuda + transpose_pad_permute_quant_cuda.
+void amax_transpose_pad_permute_quant_cuda(
+                torch::Tensor input,
+                torch::Tensor output,
+                torch::Tensor amax,
+                double scale_max,
+                int tensor_layout,
+                int lag,
+                int red_tokens)
+{
+  CHECK_CUDA(input); CHECK_CUDA(output); CHECK_CUDA(amax);
+  CHECK_LASTDIM_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(output); CHECK_CONTIGUOUS(amax);
+  CHECK_DIMS(input, 4); CHECK_DIMS(output, 4); CHECK_DIMS(amax, 3);
+  TORCH_CHECK(amax.scalar_type() == torch::kFloat, "amax must be float32");
+  TORCH_CHECK(output.scalar_type() == torch::kFloat8_e4m3fn ||
+              output.scalar_type() == torch::kChar ||
+              output.scalar_type() == torch::kByte, "output must be fp8(e4m3) or int8/uint8 storage");
+
+  const int batch_size = input.size(0);
+  const int head_dim = input.size(3);
+  const int num_tokens = tensor_layout == 0 ? input.size(1) : input.size(2);
+  const int num_heads = tensor_layout == 0 ? input.size(2) : input.size(1);
+  const int padded = (num_tokens + kL2QuantTokens - 1) / kL2QuantTokens * kL2QuantTokens;
+  CHECK_SHAPE(amax, batch_size, num_heads, head_dim);
+  if (tensor_layout == 0) {
+    CHECK_SHAPE(output, batch_size, head_dim, num_heads, padded);
+  } else {
+    CHECK_SHAPE(output, batch_size, num_heads, head_dim, padded);
+  }
+
+  launch_l2_reduce_quant<true>(input, output, torch::Tensor(), amax, torch::Tensor(),
+                               static_cast<float>(scale_max), tensor_layout, lag, red_tokens,
+                               output.stride(0),
+                               tensor_layout == 0 ? output.stride(1) : output.stride(2),
+                               tensor_layout == 0 ? output.stride(2) : output.stride(1));
 }

@@ -46,6 +46,8 @@ except:
 
 from .quant import per_block_int8 as per_block_int8_cuda
 from .quant import per_warp_int8 as per_warp_int8_cuda
+from .quant import per_warp_int8_smooth_k as per_warp_int8_smooth_k_cuda
+from . import quant as _quant_mod
 from .quant import sub_mean
 from .quant import per_channel_fp8
 
@@ -769,8 +771,17 @@ def sageattn_qk_int8_pv_fp8_cuda(
     seq_dim = 1 if _tensor_layout == 0 else 2
     nh_dim = 2 if _tensor_layout == 0 else 1    
 
-    if smooth_k:
+    # K mean fused into the K quantization launch (one DRAM pass over K).
+    fused_smooth_k = smooth_k and qk_quant_gran == "per_warp" and _quant_mod.L2_FUSED
+
+    if fused_smooth_k:
+        q_int8, q_scale, k_int8, k_scale, km = per_warp_int8_smooth_k_cuda(q, k, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32)
+    elif smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
+    else:
+        km = None
+
+    if smooth_k and return_lse:
         nqheads = q.size(nh_dim)
         nkheads = k.size(nh_dim)
         q_per_kv_heads = nqheads // nkheads
@@ -779,15 +790,14 @@ def sageattn_qk_int8_pv_fp8_cuda(
             km_broadcast = torch.repeat_interleave(km, q_per_kv_heads, dim=nh_dim)
         else:
             km_broadcast = km
-        if return_lse:
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(q.transpose(1, 2), km_broadcast.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-            else:
-                lse_correction = torch.matmul(q, km_broadcast.transpose(2, 3)).squeeze(-1).to(torch.float32)
-    else:
-        km = None
+        if tensor_layout == "NHD":
+            lse_correction = torch.matmul(q.transpose(1, 2), km_broadcast.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
+        else:
+            lse_correction = torch.matmul(q, km_broadcast.transpose(2, 3)).squeeze(-1).to(torch.float32)
 
-    if qk_quant_gran == "per_warp":
+    if fused_smooth_k:
+        pass
+    elif qk_quant_gran == "per_warp":
         q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64)
     elif qk_quant_gran == "per_thread":
         q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64)

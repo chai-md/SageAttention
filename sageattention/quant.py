@@ -14,10 +14,30 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
 import torch
 from typing import Any, List, Literal, Optional, Tuple, Union
 
 from . import _fused
+
+# Single-launch "reduce then quantize" kernels that re-read each head from L2
+# instead of DRAM (K mean + K int8, V amax + V fp8).  Set SAGEATTN_L2_FUSED=0
+# to fall back to the separate reduction / quantization kernels.
+L2_FUSED = os.environ.get("SAGEATTN_L2_FUSED", "1") != "0"
+# Tuning knobs for those kernels (measured on GB10, see REPORT.md):
+#   lag: 1 = reduce(head h+1) overlaps quant(head h); 0 = strictly per head
+#        (lag 0 was slower at every size, SMs idle while spinning).
+#   red_tokens: tokens per reduce CTA, multiple of 64; 0 = _l2_red_tokens(L).
+L2_LAG = int(os.environ.get("SAGEATTN_L2_LAG", "1"))
+L2_RED_TOKENS = int(os.environ.get("SAGEATTN_L2_RED_TOKENS", "0"))
+
+
+def _l2_red_tokens(num_tokens: int) -> int:
+    """~8 reduce CTAs per head, clamped to [512, 2048] tokens (best on GB10 for 4k-32k)."""
+    if L2_RED_TOKENS > 0:
+        return L2_RED_TOKENS
+    rt = (num_tokens // 8 + 63) // 64 * 64
+    return min(2048, max(512, rt))
 
 def per_block_int8(
     q: torch.Tensor, 
@@ -179,6 +199,46 @@ def per_warp_int8(
     
     return q_int8, q_scale, k_int8, k_scale
 
+def per_warp_int8_smooth_k(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    BLKQ: int = 128,
+    WARPQ: int = 32,
+    tensor_layout: str = "HND"
+):
+    """
+    Same result as ``per_warp_int8(q, k, k.mean(seq_dim, keepdim=True), BLKQ, WARPQ, BLKK=64)``,
+    but the mean of `k` is computed inside the K quantization launch, so K is
+    streamed from DRAM once (the quantize pass re-reads each head from L2).
+
+    Returns ``(q_int8, q_scale, k_int8, k_scale, km)`` where ``km`` has the
+    shape of ``k.mean(dim=seq_dim, keepdim=True)`` and the dtype of `k`.
+    """
+    BLKK = 64
+    q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
+    k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
+
+    if tensor_layout == "HND":
+        b, h_qo, qo_len, head_dim = q.shape
+        _, h_kv, kv_len, _ = k.shape
+    elif tensor_layout == "NHD":
+        b, qo_len, h_qo, head_dim = q.shape
+        _, kv_len, h_kv, _ = k.shape
+    else:
+        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+
+    _tensor_layout = 0 if tensor_layout == "NHD" else 1
+
+    q_scale = torch.empty((b, h_qo, ((qo_len + BLKQ - 1) // BLKQ) * (BLKQ // WARPQ)), device=q.device, dtype=torch.float32)
+    k_scale = torch.empty((b, h_kv, (kv_len + BLKK - 1) // BLKK), device=q.device, dtype=torch.float32)
+    km = torch.empty((b, h_kv, head_dim), device=k.device, dtype=k.dtype)
+
+    _fused.quant_per_warp_int8_cuda(q, q_int8, q_scale, BLKQ, WARPQ, _tensor_layout)
+    _fused.mean_quant_per_block_int8_cuda(k, km, k_int8, k_scale, _tensor_layout, L2_LAG, _l2_red_tokens(kv_len))
+
+    km = km.unsqueeze(2) if _tensor_layout == 1 else km.unsqueeze(1)
+    return q_int8, q_scale, k_int8, k_scale, km
+
 def sub_mean(
     v: torch.Tensor, 
     tensor_layout: str ="HND"
@@ -282,10 +342,15 @@ def per_channel_fp8(
         # two passes over V (vs three in the generic path, which materialises a
         # transposed FP16 copy).  Saves ~40% of the DRAM traffic of this stage,
         # which matters on bandwidth-starved parts (GB10: ~220 GB/s).
-        amax = torch.zeros((b, h_kv, head_dim), dtype=torch.float32, device=v.device)
-        _fused.channel_amax_cuda(v, amax, _tensor_layout)
         v_fp8 = torch.empty(out_shape, dtype=torch.float8_e4m3fn, device=v.device)
-        _fused.transpose_pad_permute_quant_cuda(v, v_fp8, amax, scale_max, _tensor_layout)
+        if L2_FUSED:
+            # one launch: the quantize pass of each head re-reads it from L2
+            amax = torch.empty((b, h_kv, head_dim), dtype=torch.float32, device=v.device)
+            _fused.amax_transpose_pad_permute_quant_cuda(v, v_fp8, amax, scale_max, _tensor_layout, L2_LAG, _l2_red_tokens(kv_len))
+        else:
+            amax = torch.zeros((b, h_kv, head_dim), dtype=torch.float32, device=v.device)
+            _fused.channel_amax_cuda(v, amax, _tensor_layout)
+            _fused.transpose_pad_permute_quant_cuda(v, v_fp8, amax, scale_max, _tensor_layout)
         return v_fp8, amax / scale_max, None
 
     v_transposed_permutted = torch.empty(out_shape, dtype=v.dtype, device=v.device)
