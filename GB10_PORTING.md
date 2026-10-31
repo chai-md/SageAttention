@@ -1,6 +1,6 @@
 # SageAttention 2.2.0 / SageAttention3 — DGX Spark (GB10 / sm_121) 対応メモ
 
-対象: `/home/chai/SageAttention` / ブランチ `gb10-sm121`
+対象: `/home/chai/SageAttention` / フォーク `chai-md/SageAttention` の `main`
 環境: DGX Spark GB10 (sm_121, 48 SM, L2 24 MB), torch 2.15.0+cu132, CUDA toolkit 13.0 (nvcc),
 Python 3.13.14, venv `/home/chai/ComfyUI/.venv`
 

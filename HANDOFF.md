@@ -1,7 +1,9 @@
 # 引き継ぎ書 — SageAttention GB10 (sm_121) 対応の続き
 
 最終更新: 2026-10-31 / 作業者: Hermes (dgxspark1)
-対象: `/home/chai/SageAttention` ブランチ **`gb10-sm121`**（`main` から分岐、未 push）
+対象: `/home/chai/SageAttention` — **リモートは `chai-md/SageAttention` の `main` に直接 push 済み**
+（機能ブランチは作らない運用。ローカルの `gb10-sm121` は同じ commit を指す名残なので、
+作業は `main` で行ってよい）。
 
 > このファイルだけ読めば作業を再開できるように書いてある。技術的な詳細・実測値・設計判断は
 > 同ディレクトリの **`GB10_PORTING.md`** を参照。まず `git log -1` と `git diff main --stat` を見ること。
@@ -108,7 +110,7 @@ SAGE3_NUM_SM=96 python /home/chai/SageAttention/bench/bench_gb10.py --suite sa3 
 
 ## 5. 触ってはいけない / 注意
 
-* `main` ブランチに戻さない。`git checkout main` すると未コミット変更が散らばる。
+* 作業ブランチは `main`（フォークの既定）。機能ブランチは作らず `main` に直接 push する運用。
 * **入力テンソルを in-place で書き換えない**。旧 SA3 は `k -= k.mean(...)` をしていたが、
   現在は非破壊（呼び出し側のテンソルを保つ）。この性質を壊さない。
 * `smooth_v=True` の SA2 経路は**旧実装のまま**（新カーネル未対応）。触るなら
@@ -182,7 +184,7 @@ SA2 内訳（同, 合計 23.2 ms）: attn kernel 20.5 / quantK+mean 1.66 / V qua
 
 ```bash
 # 1. レビュー用の worktree を切る（メインの作業ツリーを汚さない）
-git -C /home/chai/SageAttention worktree add -b review-X /home/chai/worktrees/sa-X gb10-sm121
+git -C /home/chai/SageAttention worktree add -b review-X /home/chai/worktrees/sa-X main
 
 # 2. ブリーフを置く（reviews/briefs/ に実例: sa3.md, sa2.md）
 #    - GB10 の roofline 実測値 / 既にやった最適化 / 触ってよい範囲 /
@@ -210,7 +212,7 @@ cd /home/chai/worktrees/sa-X && claude -p "Read BRIEF.md and execute it" \
 ## 9. エージェントに渡すときのプロンプト例
 
 ```
-/home/chai/SageAttention のブランチ gb10-sm121 で作業を続けてください。
+/home/chai/SageAttention の main ブランチで作業を続けてください（フォーク chai-md/SageAttention に直接 push）。
 まず HANDOFF.md と GB10_PORTING.md を読んでください。
 タスクは HANDOFF.md の T1（SA3 の delta_s を bf16 化）です。
 変更後は必ず:
