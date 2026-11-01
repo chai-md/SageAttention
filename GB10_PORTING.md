@@ -418,6 +418,9 @@ COMFY_SOL_ATTN=1 COMFY_SOL_TAU=1.0 .venv/bin/python main.py --use-sage-attention
 * `head_dim != 128` / bf16・fp16 以外 / mask あり / Sol カーネル非対応デバイス は
   自動で dense 経路にフォールバックする（グラフを落とさない）。
 * env は import 時に読むので、切り替えには ComfyUI の再起動が必要。
+* 有効化されるとモデルロード時に `COMFY_SOL_ATTN=1: routing attention to Sol-Attn (tau=….)` を
+  1 回だけログに出す（起動ログの `Using sage attention` はグローバル側の表示で、H3 の
+  アテンションが sage で動いていることを意味しない）。
 
 H3 の実呼び出し形（containers + `skip_reshape=True`、H=56, L=12,555）での実測:
 
