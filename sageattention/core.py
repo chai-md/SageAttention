@@ -16,6 +16,7 @@ limitations under the License.
 
 import torch
 import torch.nn.functional as F
+import os
 
 from .triton.quant_per_block import per_block_int8 as per_block_int8_triton
 from .triton.quant_per_block_varlen import per_block_int8 as per_block_int8_varlen_triton
@@ -141,7 +142,19 @@ def sageattn(
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
     - All tensors must be on the same cuda device.
     """
-        
+    # GB10 (sm_121) tuning knobs, see GB10_PORTING.md §6.  On the int8/fp8 path the
+    # QK quantisation granularity and the PV accumulator are worth a few percent and
+    # the best pair depends on the shape (per_warp+fp32 wins at L~12k / H=56, which
+    # is MiniMax-H3 territory).  Overriding from the environment lets ComfyUI - which
+    # calls sageattn() with no extra arguments - pick the tuned pair without patching
+    # the node.  Invalid values fall back to the per-arch defaults below.
+    _gran = os.environ.get("SAGEATTN_QK_GRAN")
+    _accum = os.environ.get("SAGEATTN_PV_ACCUM")
+    if _gran not in (None, "per_warp", "per_thread"):
+        _gran = None
+    if _accum not in (None, "fp32", "fp32+fp16", "fp32+fp32"):
+        _accum = None
+
     arch = get_cuda_arch_versions()[q.device.index]
     if arch == "sm80":
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
@@ -152,9 +165,9 @@ def sageattn(
     elif arch == "sm90":
         return sageattn_qk_int8_pv_fp8_cuda_sm90(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32")
     elif arch == "sm120":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16") # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran=_gran or "per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype=_accum or "fp32+fp16") # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
     elif arch == "sm121":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16") # sm121 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm121.
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran=_gran or "per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype=_accum or "fp32+fp16") # sm121 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm121.
     else:
         raise ValueError(f"Unsupported CUDA architecture: {arch}")
 

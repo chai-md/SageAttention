@@ -339,6 +339,12 @@ Flux/SD3.5 は 128 なので影響なし、SDXL 系や一部モデル（D=80/96�
 
 ## 6. 落とし穴
 
+* **`pv_accum_dtype="fp16"` は sm_120/sm_121 で壊れている**（2026-10-31 実測）。呼ぶと 4–6 ms で
+  返ってきて「4 倍速い」ように見えるが、出力は cos ≈ 0.000（absmax が正解の 5 倍）。
+  `accum_f16` カーネルがこの arch で正しく動いていない。H3 形状（H=56, L=12555）で
+  `cos -0.000198`／`0.000020`。**使わない**。
+* **計測は interleaved A/B で**。同条件の逐次計測だとクロック変動で ±5% 平気でぶれる
+  （同じ設定が 32.8 ms と 34.0 ms を行き来した）。`default → 変更 → default` を交互に 3–4 周。
 * **リポジトリ直下で Python を走らせない**。`/home/chai/SageAttention/sageattention` が
   site-packages を隠し、`_fused` 等の .so が見つからず `ImportError` になる。`cd /tmp` などから実行する。
 * venv に `pip` が無い → `uv pip install --no-build-isolation .`（build isolation を切らないと
@@ -349,3 +355,43 @@ Flux/SD3.5 は 128 なので影響なし、SDXL 系や一部モデル（D=80/96�
   `launch.h` / `kernel_*` を触ると `api.cu` の再コンパイルが走る。
 * `sageattention3_blackwell/csrc/cutlass`（230 MB）と `build/`、`*.egg-info` はコミットしない。
 * SA2 の `per_channel_fp8` は `smooth_v=False` のときだけ新経路。`smooth_v=True` は旧経路（未検証のため）。
+
+## 7. MiniMax-H3 の形状での実測（2026-10-31）
+
+H3 の実チェックポイント（`minimax_h3_fl2va_pruned_int8`）から読んだ形状:
+
+| 項目 | 値 |
+|---|---|
+| DiT | 50 ブロック（+ token_refiner 2）、dim 5376、**56 heads × 128**（attn 内寸 7168） |
+| VAE | 空間 16x / 時間 4x、z=24ch、パッチ 2 → `tokens = ceil(frames/4)·(w/32)·(h/32)` |
+| 0.4 MP = 864×480 | 405 tok/フレーム → 121f: **L=12,555** / 241f: **L=24,705** |
+
+SA2 の内訳（H=56, L=12,555, bf16, per layer）:
+
+| 段 | ms | 率 | 実効帯域/演算 |
+|---|---:|---:|---|
+| K 量子化（mean+int8 融合） | 2.85 | 8.7% | 95 GB/s（DRAM 220） |
+| V 量子化（amax+transpose+fp8） | 1.73 | 5.3% | 208 GB/s = ほぼ上限 |
+| attn カーネル | 28.19 | 86.0% | 160 TFLOPS = int8 mma 実測ピーク 215 の 75% |
+| 合計 | 32.8 | | 50 ブロックで 1.64 s/forward |
+
+**効くレバー（実測済み）**
+* `SAGEATTN_PV_ACCUM=fp32` で **-3.9%**（33.28 → 31.98 ms、interleaved 4 周の中央値。
+  cos 0.999245 vs 0.999244 で精度差なし）。sm_121 の既定は `per_warp` + `fp32+fp16` なので、
+  変えるのは accum だけ。ComfyUI は引数を渡さないため env で効くようにしてある。
+* `SAGEATTN_QK_GRAN=per_thread` は **+4% 遅い**（既定の per_warp が正しい）。
+* `SAGEATTN_L2_FUSED=0`（3 パス）は **+3.4% 遅い**、`SAGEATTN_L2_LAG=0` は **+4.7% 遅い**。
+  56 ヘッドでも融合 + lag=1 が最良で、スピン待ちの損は他経路より小さい。
+
+**残レバー（未実施・見積り）**
+| 施策 | 見込み | 難易度 |
+|---|---|---|
+| K 量子化を「先にロード、mean 待ちはその後」に組み替え | -1.0 ms/-3% | 低（fused.cu 内で完結） |
+| V 量子化を attn カーネルに融合（bf16 V を受け smem で量子化） | -1.7 ms/-5% | 中（smem +2 KB/tile） |
+| `CTA_K=64→128` を swizzle/permutation ごと再設計（今は壊れる） | -3〜5 ms/-10〜15% | 高 |
+| 低スコア K ブロックのスキップ（ブロックスパース） | 最大 -40% | 高・品質検証必須 |
+
+**重要な观察**: 同じ形状で SA3（NVFP4 / CUTLASS、MMA ピーク 2 倍）も 33.3 ms = 136 TFLOPS で
+SA2 と同等。**この形状の律速は MMA スループットではなくタイル毎の softmax/P 変換の直列鎖**なので、
+tcgen05 で int8 カーネルを書き直しても伸びない見込み。効くのは「タイル数を減らす（CTA_K 拡大）」と
+「パスを減らす（V 融合）」の 2 方向。
