@@ -395,3 +395,37 @@ SA2 の内訳（H=56, L=12,555, bf16, per layer）:
 SA2 と同等。**この形状の律速は MMA スループットではなくタイル毎の softmax/P 変換の直列鎖**なので、
 tcgen05 で int8 カーネルを書き直しても伸びない見込み。効くのは「タイル数を減らす（CTA_K 拡大）」と
 「パスを減らす（V 融合）」の 2 方向。
+
+## 8. ComfyUI 側の Sol-Attn を H3 で試す（env ゲート）
+
+最新の ComfyUI は `comfy_kitchen.sol_attn`（arxiv 2607.24027、ブロックルーティング型の
+スパースアテンション）を持っているが、**チェックポイントの `config` テンソルが
+`{"attention":"comfy_kitchen_sol"}` を宣言したモジュールでしか有効にならない**。
+H3 の `pruned_int8_convrot` は `config` も `to_gate_compress`（VSA 学習済みの印）も持たないので、
+`--use-sage-attention` を外しても Sol にはならず、単に dense SDPA に落ちるだけ。
+
+そこで計測用の env ゲートを追加した（`patches/comfyui-sol-attn-env-gate.patch`）:
+
+```
+cd /home/chai/ComfyUI
+git apply /home/chai/SageAttention/patches/comfyui-sol-attn-env-gate.patch   # 未適用なら
+COMFY_SOL_ATTN=1 COMFY_SOL_TAU=1.0 .venv/bin/python main.py --use-sage-attention
+```
+
+* `COMFY_SOL_ATTN=1` … `preferred_attention` を渡すモデル（H3 の `Attention` が該当）で、
+  config を持たないモジュールを Sol に振る。渡さないモデル（VAE 等）には影響しない。
+* `COMFY_SOL_TAU` … ルーティング閾値（既定 1.0、大きいほど速く不正確）。
+* `head_dim != 128` / bf16・fp16 以外 / mask あり / Sol カーネル非対応デバイス は
+  自動で dense 経路にフォールバックする（グラフを落とさない）。
+* env は import 時に読むので、切り替えには ComfyUI の再起動が必要。
+
+H3 の実呼び出し形（containers + `skip_reshape=True`、H=56, L=12,555）での実測:
+
+| | 1 層 | 50 ブロック/forward |
+|---|---:|---:|
+| sage（既定） | 35.0 ms | 1.75 s |
+| sol tau=1.0 | **12.7 ms (2.76x)** | **0.63 s** |
+
+出力形状は `(1, L, 7168)` で `out_proj` の期待と一致（確認済み）。
+**品質は未検証**: 乱数 q/k/v では注意が一様になり cos 0.67 としか出ない（これは品質指標にならない）。
+同一シードで dense と Sol の 2 本を生成し、latent 差と見た目で判断すること。

@@ -1,0 +1,58 @@
+diff --git a/comfy/ldm/modules/attention.py b/comfy/ldm/modules/attention.py
+index abed292b..b65fb036 100644
+--- a/comfy/ldm/modules/attention.py
++++ b/comfy/ldm/modules/attention.py
+@@ -1,5 +1,6 @@
+ import math
+ import sys
++import os
+ import inspect
+ import json
+ 
+@@ -55,6 +56,18 @@ except ImportError:
+ 
+ COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE = comfy_kitchen.int8_attention_is_available()
+ 
++# Opt-in hook for benchmarking Sol-Attn on models that do not ask for it: checkpoints
++# normally select it per module via their `config` tensor ("comfy_kitchen_sol"), which
++# non-VSA-trained models such as MiniMax-H3 do not carry.  With COMFY_SOL_ATTN=1 every
++# module that has no config (and no other per-module backend) is routed to Sol-Attn at
++# COMFY_SOL_TAU.  Off by default; the kernels only accept head_dim 128 in bf16/fp16 and
++# attention_comfy_kitchen_sol falls back to the dense path for anything else.
++SOL_ATTN_FORCED = os.environ.get("COMFY_SOL_ATTN", "").strip().lower() not in ("", "0", "false", "off", "no")
++try:
++    SOL_ATTN_TAU = float(os.environ.get("COMFY_SOL_TAU", "1.0") or 1.0)
++except ValueError:
++    SOL_ATTN_TAU = 1.0
++
+ REGISTERED_ATTENTION_FUNCTIONS = {}
+ def register_attention_function(name: str, func: Callable):
+     # avoid replacing existing functions
+@@ -107,6 +120,10 @@ class ComfyAttention(ConfigurableModule):
+                 if self.function is not None:
+                     self.method = method
+                     break
++        if self.function is None and SOL_ATTN_FORCED and comfy_kitchen.sol_attn_is_available(model_management.get_torch_device()):
++            # COMFY_SOL_ATTN=1: benchmark path for checkpoints that never select Sol themselves.
++            self.function = functools.partial(attention_comfy_kitchen_sol, tau=SOL_ATTN_TAU)
++            self.method = "comfy_kitchen_sol"
+         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+ 
+     def _save_to_state_dict(self, destination, prefix, keep_vars):
+@@ -697,10 +714,14 @@ attention_comfy_kitchen_int8.container_function = _attention_comfy_kitchen_int8_
+ 
+ @wrap_attn
+ def attention_comfy_kitchen_sol(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, *, tau=1.0, **kwargs):
+-    if mask is not None:
++    dim_head = q.shape[-1] if skip_reshape else q.shape[-1] // heads
++    # Sol-Attn is head_dim 128 + bf16/fp16 only and honours no mask.  COMFY_SOL_ATTN=1 routes
++    # *every* unconfigured module here, so serve the ones it cannot take from the dense path
++    # instead of failing the whole graph.
++    if mask is not None or dim_head != 128 or q.dtype not in (torch.bfloat16, torch.float16) \
++            or not comfy_kitchen.sol_attn_is_available(q.device):
+         return attention_pytorch(q, k, v, heads, mask=mask, attn_precision=attn_precision, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+ 
+-    dim_head = q.shape[-1] if skip_reshape else q.shape[-1] // heads
+     b = q.shape[0]
+     if skip_reshape:
+         q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))
