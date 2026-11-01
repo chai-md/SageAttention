@@ -396,52 +396,25 @@ SA2 と同等。**この形状の律速は MMA スループットではなくタ
 tcgen05 で int8 カーネルを書き直しても伸びない見込み。効くのは「タイル数を減らす（CTA_K 拡大）」と
 「パスを減らす（V 融合）」の 2 方向。
 
-## 8. ComfyUI 側の Sol-Attn を H3 で試す（env ゲート）
+## 8. ComfyUI の Sol-Attn を H3 で試した結果（不採用）
 
-最新の ComfyUI は `comfy_kitchen.sol_attn`（arxiv 2607.24027、ブロックルーティング型の
-スパースアテンション）を持っているが、**チェックポイントの `config` テンソルが
-`{"attention":"comfy_kitchen_sol"}` を宣言したモジュールでしか有効にならない**。
-H3 の `pruned_int8_convrot` は `config` も `to_gate_compress`（VSA 学習済みの印）も持たないので、
-`--use-sage-attention` を外しても Sol にはならず、単に dense SDPA に落ちるだけ。
+最新の ComfyUI は `comfy_kitchen.sol_attn`（arxiv 2607.24027、ブロックルーティング型スパース
+アテンション）を持つが、**チェックポイントの `config` テンソルが
+`{"attention":"comfy_kitchen_sol"}` を宣言したモジュールでしか有効にならない**。H3 の
+`pruned_int8_convrot` は `config` も `to_gate_compress`（VSA 学習済みの印）も持たないため、
+`--use-sage-attention` の有無では Sol は選ばれない（外すと dense SDPA に落ちるだけ）。
 
-そこで計測用の env ゲートを追加した（`patches/comfyui-sol-attn-env-gate.patch`）:
+計測用に env ゲート（`COMFY_SOL_ATTN` / `COMFY_SOL_TAU`、`preferred_attention` を渡す
+モジュールだけを Sol に振る）を一時的に入れて評価した。**結論は不採用**で、ゲートは削除済み。
 
-```
-cd /home/chai/ComfyUI
-git apply /home/chai/SageAttention/patches/comfyui-sol-attn-env-gate.patch   # 未適用なら
-COMFY_SOL_ATTN=1 COMFY_SOL_TAU=1.0 .venv/bin/python main.py --use-sage-attention
-```
-
-* `COMFY_SOL_ATTN=1` … `preferred_attention` を渡すモデル（H3 の `Attention` が該当）で、
-  config を持たないモジュールを Sol に振る。渡さないモデル（VAE 等）には影響しない。
-* `COMFY_SOL_TAU` … ルーティング閾値（既定 1.0、大きいほど速く不正確）。
-* `head_dim != 128` / bf16・fp16 以外 / mask あり / Sol カーネル非対応デバイス は
-  自動で dense 経路にフォールバックする（グラフを落とさない）。
-* env は import 時に読むので、切り替えには ComfyUI の再起動が必要。
-* 有効化されるとモデルロード時に `COMFY_SOL_ATTN=1: routing attention to Sol-Attn (tau=….)` を
-  1 回だけログに出す（起動ログの `Using sage attention` はグローバル側の表示で、H3 の
-  アテンションが sage で動いていることを意味しない）。
-
-H3 の実呼び出し形（containers + `skip_reshape=True`、H=56, L=12,555）での実測:
-
-| | 1 層 | 50 ブロック/forward |
+| | 1 層 (L=12,555) | 実運用 s/it (0.4 MP, 5s) |
 |---|---:|---:|
-| sage（既定） | 35.0 ms | 1.75 s |
-| sol tau=1.0 | **12.7 ms (2.76x)** | **0.63 s** |
+| sage（既定） | 33.0 ms | 7.3 |
+| sol tau=1.0 | 12.8 ms (2.6x) | 5.7 (-22%) |
 
-出力形状は `(1, L, 7168)` で `out_proj` の期待と一致（確認済み）。
-**品質は未検証**: 乱数 q/k/v では注意が一様になり cos 0.67 としか出ない（これは品質指標にならない）。
-同一シードで dense と Sol の 2 本を生成し、latent 差と見た目で判断すること。
-
-### 実運用での効果（MiniMax-H3, 0.4 MP, 2026-11-01）
-
-ComfyUI に `COMFY_SOL_ATTN=1 COMFY_SOL_TAU=1.0` を入れて同一ワークフローを実行:
-
-| | s/it | 差分 |
-|---|---:|---:|
-| sage（既定） | 7.3 | — |
-| Sol tau=1.0 | **5.7** | **-1.6 s（-22%）** |
-
-1 層あたりの実測差（35.0 → 12.7 ms、50 ブロックで -1.12 s/forward）より大きいが、
-実運用では token_refiner や他モジュールの attention も同じゲートを通り、また実走行では
-L2/DRAM を MLP と共有するため sage 側がベンチより遅い方向に出る。**品質の A/B は未実施**。
+* 速度は出る（-22%）が、**画質の劣化が明確**（ユーザー評価, 2026-11-01）。
+* 原因: VSA 学習済みでないため coarse gate が無く、ブロック平均 q·k という代理指標で
+  ルーティングする。tau=1.0 は代理分布の 1σ 閾値＝キーブロックの約 16% しか厳密に見ない。
+* tau を下げると改善幅は縮む（実測: 0.25/20.8, 0.35/19.4, 0.5/18.3, 0.75/15.6, 1.0/12.8 ms）。
+  tau=0.35 でも -15% 程度なので、品質劣化との対価が合わない。
+* 将来 VSA 学習済みの H3（`to_gate_compress` 付き）や SLA LoRA が入った場合に再評価する価値はある。
