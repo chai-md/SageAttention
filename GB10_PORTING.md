@@ -1,8 +1,8 @@
 # SageAttention 2.2.0 / SageAttention3 — DGX Spark (GB10 / sm_121) 対応メモ
 
-対象: `/home/chai/SageAttention` / フォーク `chai-md/SageAttention` の `main`
+対象: このフォーク（`chai-md/SageAttention` の `main`）の clone。以下の `<REPO>` はそのディレクトリを指す
 環境: DGX Spark GB10 (sm_121, 48 SM, L2 24 MB), torch 2.15.0+cu132, CUDA toolkit 13.0 (nvcc),
-Python 3.13.14, venv `/home/chai/ComfyUI/.venv`
+Python 3.13.14。ビルド先は **ComfyUI が使っている仮想環境**（以下 `$VENV`。`source .venv/bin/activate` など環境ごとに読み替える）
 
 ---
 
@@ -46,20 +46,27 @@ df -h ~ | tail -1                       # CUTLASS 用に 1 GB 以上
 （`12.1a` でも可）。渡さないと GPU 検出にフォールバックし、他のカードで作った .so を
 持ち込んだときに `ImportError` になる。
 
-### 1.1 ケース A: ホストの ComfyUI venv（このマシンの構成）
+### 1.1 ケース A: ホストの仮想環境（このマシンの構成）
+
+ComfyUI が使っている仮想環境を有効化する。**パスは環境ごとに読み替える**
+（ComfyUI 直下の `.venv`、`$COMFYUI_DIR/.venv`、conda 環境など）:
 
 ```bash
-REPO=/home/chai/SageAttention
-VENV=/home/chai/ComfyUI/.venv          # ComfyUI が使っている venv を指す
+source .venv/bin/activate                        # 例: ComfyUI ディレクトリ直下の .venv
+python -c "import sys; print(sys.executable)"    # ← この仮想環境に入ることを確認
+```
 
-cd "$REPO"
+以降は**有効化した python をそのまま使う**（絶対パスを直書きしない）:
+
+```bash
+cd <REPO>
 CXX_APPEND_FLAGS="-std=c++20" NVCC_APPEND_FLAGS="-std=c++20" \
 TORCH_CUDA_ARCH_LIST=12.1 MAX_JOBS=8 \
-  uv pip install --python "$VENV/bin/python" --no-build-isolation .   # SA2
+  uv pip install --python "$(command -v python)" --no-build-isolation .   # SA2
 
-cd "$REPO/sageattention3_blackwell"
+cd sageattention3_blackwell
 TORCH_CUDA_ARCH_LIST=12.1 MAX_JOBS=8 \
-  uv pip install --python "$VENV/bin/python" --no-build-isolation .   # SA3
+  uv pip install --python "$(command -v python)" --no-build-isolation .   # SA3
 ```
 
 * **C++20 は環境変数で渡せる**。`setup.py` は `CXX_APPEND_FLAGS` / `NVCC_APPEND_FLAGS` を
@@ -68,15 +75,17 @@ TORCH_CUDA_ARCH_LIST=12.1 MAX_JOBS=8 \
 * **SA3 は環境変数非対応**。`sageattention3_blackwell/setup.py` の `nvcc_flags` と
   `extra_compile_args["cxx"]` に `-std=c++20` を直接書く必要がある（このリポジトリでは変更済み）。
 * `--no-build-isolation` を外すとビルド分離環境で torch を解決しにいって失敗する。
-* venv に `pip` が無い場合は `python -m pip` 不可 → `uv pip` か、pip 入りの venv なら
-  `python -m pip install --no-build-isolation .`。
+* 仮想環境に `pip` が無い場合は `python -m pip` は不可 → `uv pip` を使う。pip があるなら
+  `python -m pip install --no-build-isolation .` でも同じ。
 * 目安: SA2 1.5〜4 分 / SA3 2〜6 分。`sageattention3_blackwell/csrc/cutlass` は setup.py が
   自動 clone する（約 230 MB、ネットワーク必須）。
 
 ### 1.2 ケース B: spark-comfyui のコンテナ（他の DGX Spark は通常こちら）
 
-`/home/chai/ComfyUI/.venv` は**存在しない**。ComfyUI はイメージ内の
-`/opt/ComfyUI` + `/opt/comfyui-env` で動き、SageAttention は**イメージビルド時に焼き込まれる**:
+ホスト側の仮想環境（`ComfyUI/.venv` など）は**存在しない**。ComfyUI はイメージ内の
+`/opt/ComfyUI` と**イメージ内の仮想環境**（このキットでは `/opt/comfyui-env`。
+コンテナ内で `echo $VIRTUAL_ENV` を見れば分かる）で動き、SageAttention は
+**イメージビルド時に焼き込まれる**:
 
 ```
 container/Dockerfile:62   ARG SAGE_REPO=https://github.com/thu-ml/SageAttention.git
@@ -100,13 +109,14 @@ spark-comfyui.sh:205      SAGE_REF=${SAGE_REF:-d1a57a54...}      # upstream main
 その場で試すだけならコンテナ内に入れる（**イメージ更新で消える**点に注意）:
 
 ```bash
+# コンテナ内では既定で仮想環境が有効（$VIRTUAL_ENV を確認）
 docker exec -it <container> bash -lc '
   cd /opt && git clone https://github.com/chai-md/SageAttention.git sa-port &&
   cd sa-port && CXX_APPEND_FLAGS="-std=c++20" NVCC_APPEND_FLAGS="-std=c++20" \
   TORCH_CUDA_ARCH_LIST=12.1 MAX_JOBS=4 \
-    uv pip install --python /opt/comfyui-env/bin/python --no-build-isolation --no-deps . &&
+    uv pip install --python "$(command -v python)" --no-build-isolation --no-deps . &&
   cd sageattention3_blackwell && TORCH_CUDA_ARCH_LIST=12.1 MAX_JOBS=4 \
-    uv pip install --python /opt/comfyui-env/bin/python --no-build-isolation --no-deps .'
+    uv pip install --python "$(command -v python)" --no-build-isolation --no-deps .'
 ```
 
 SA3（`sageattn3`）は Dockerfile の対象外なので、ケース B では必ず手動で入れる。
@@ -302,13 +312,13 @@ end-to-end 19.9 → 18.0 ms。D=64 は V タイルが半分で逆効果（+5%）
 ## 3. 数値検証
 
 ```bash
-cd /tmp   # ← リポジトリ直下で実行すると source tree が site-packages を隠す
-python /home/chai/SageAttention/bench/verify_v_quant.py   # SA2 V量子化のビット一致
-python /home/chai/SageAttention/bench/smoke_test.py       # fp16/bf16, GQA, NHD, causal, D=64/128
-python /home/chai/SageAttention/bench/sa3_mask_test.py    # SA3 の causal / 短い K 長（44 ケース）
-python /home/chai/SageAttention/bench/stress_l2_fused.py  # SA2 の L2 融合カーネル（48 形状＋連続呼び出し）
-python /home/chai/SageAttention/bench/bench_gb10.py --suite sa2 --stages
-python /home/chai/SageAttention/bench/bench_gb10.py --suite sa3
+cd /tmp   # ← <REPO> から実行すると source tree が site-packages を隠す。スクリプトは絶対パスで指定
+python <REPO>/bench/verify_v_quant.py   # SA2 V量子化のビット一致
+python <REPO>/bench/smoke_test.py       # fp16/bf16, GQA, NHD, causal, D=64/128
+python <REPO>/bench/sa3_mask_test.py    # SA3 の causal / 短い K 長（44 ケース）
+python <REPO>/bench/stress_l2_fused.py  # SA2 の L2 融合カーネル（48 形状＋連続呼び出し）
+python <REPO>/bench/bench_gb10.py --suite sa2 --stages
+python <REPO>/bench/bench_gb10.py --suite sa3
 ```
 
 smoke test の結果（SDPA fp32 リファレンスとの比較）:
@@ -396,7 +406,7 @@ MMA の後に足す方式（post-add）は +0.6 ms で逆効果だった。
 
 ### P5: ComfyUI 連携
 
-`/home/chai/ComfyUI/.venv` に入っているので `import sageattention` / `from sageattn3 import
+`$VENV` に入っているので `import sageattention` / `from sageattn3 import
 sageattn3_blackwell` はそのまま動く。動画系ノードで SA3 を使う場合は
 `num_qo_heads == num_kv_heads`（GQA 非対応）と `head_dim ∈ {64,128}` の制約に注意。
 
@@ -423,7 +433,7 @@ Flux/SD3.5 は 128 なので影響なし、SDXL 系や一部モデル（D=80/96�
   `cos -0.000198`／`0.000020`。**使わない**。
 * **計測は interleaved A/B で**。同条件の逐次計測だとクロック変動で ±5% 平気でぶれる
   （同じ設定が 32.8 ms と 34.0 ms を行き来した）。`default → 変更 → default` を交互に 3–4 周。
-* **リポジトリ直下で Python を走らせない**。`/home/chai/SageAttention/sageattention` が
+* **リポジトリ直下で Python を走らせない**。`<REPO>/sageattention` が
   site-packages を隠し、`_fused` 等の .so が見つからず `ImportError` になる。`cd /tmp` などから実行する。
 * venv に `pip` が無い → `uv pip install --no-build-isolation .`（build isolation を切らないと
   torch を解決しにいって失敗する）。
