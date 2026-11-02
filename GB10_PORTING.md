@@ -31,29 +31,107 @@ Python 3.13.14, venv `/home/chai/ComfyUI/.venv`
 
 ## 1. ビルド
 
-```bash
-source /home/chai/ComfyUI/.venv/bin/activate   # or use absolute paths
-cd /home/chai/SageAttention
-TORCH_CUDA_ARCH_LIST=12.1 MAX_JOBS=8 \
-  uv pip install --python /home/chai/ComfyUI/.venv/bin/python --no-build-isolation .
+### 1.0 先に確認する（どの環境でも共通）
 
-cd /home/chai/SageAttention/sageattention3_blackwell
-MAX_JOBS=8 uv pip install --python /home/chai/ComfyUI/.venv/bin/python --no-build-isolation .
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_capability())"
+# 期待: 2.15.0+cu132 13.0 (12, 1)
+which nvcc && nvcc --version            # CUDA 13.0 の toolkit が PATH にあること
+python -c "import sys; print(sys.executable)"   # ← 入れる先の venv の python か確認
+python -c "import uv" 2>/dev/null || which uv  # venv に pip が無い環境では uv が要る
+df -h ~ | tail -1                       # CUTLASS 用に 1 GB 以上
 ```
 
-* `TORCH_CUDA_ARCH_LIST=12.1` を渡すと setup.py が `-gencode arch=compute_121a,code=sm_121a` を吐く
-  （`12.1a` でも可。setup.py 側で `a` を落として数値化する実装）。
-* SA2: 約 1.5 分 / SA3: 約 6 分（CUTLASS のテンプレートが重い）。`sageattention3_blackwell/csrc/cutlass`
-  は setup.py が自動 clone（約 230 MB）。
-* venv に `pip` モジュールが無いので `python -m pip` は不可。`uv pip` を使う。
+`TORCH_CUDA_ARCH_LIST=12.1` を渡すと `-gencode arch=compute_121a,code=sm_121a` が出る
+（`12.1a` でも可）。渡さないと GPU 検出にフォールバックし、他のカードで作った .so を
+持ち込んだときに `ImportError` になる。
 
-### C++17 → C++20
+### 1.1 ケース A: ホストの ComfyUI venv（このマシンの構成）
 
-`setup.py` / `sageattention3_blackwell/setup.py` の `-std=c++17` をすべて `-std=c++20` に変更済み
-（`CXX_FLAGS` と `NVCC_FLAGS`、SA3 は `extra_compile_args["cxx"]` も含む）。
-GB10 の CUDA 13.0 では C++20 の方が通りやすい（CUTLASS head も C++17 前提の記述が緩い）。
+```bash
+REPO=/home/chai/SageAttention
+VENV=/home/chai/ComfyUI/.venv          # ComfyUI が使っている venv を指す
 
----
+cd "$REPO"
+CXX_APPEND_FLAGS="-std=c++20" NVCC_APPEND_FLAGS="-std=c++20" \
+TORCH_CUDA_ARCH_LIST=12.1 MAX_JOBS=8 \
+  uv pip install --python "$VENV/bin/python" --no-build-isolation .   # SA2
+
+cd "$REPO/sageattention3_blackwell"
+TORCH_CUDA_ARCH_LIST=12.1 MAX_JOBS=8 \
+  uv pip install --python "$VENV/bin/python" --no-build-isolation .   # SA3
+```
+
+* **C++20 は環境変数で渡せる**。`setup.py` は `CXX_APPEND_FLAGS` / `NVCC_APPEND_FLAGS` を
+  自前のフラグの**後ろ**に足すので、最後の `-std` が勝つ。チェックアウトを汚さずに済む
+  （このリポジトリは setup.py 側も c++20 に変えてあるが、必須ではない）。
+* **SA3 は環境変数非対応**。`sageattention3_blackwell/setup.py` の `nvcc_flags` と
+  `extra_compile_args["cxx"]` に `-std=c++20` を直接書く必要がある（このリポジトリでは変更済み）。
+* `--no-build-isolation` を外すとビルド分離環境で torch を解決しにいって失敗する。
+* venv に `pip` が無い場合は `python -m pip` 不可 → `uv pip` か、pip 入りの venv なら
+  `python -m pip install --no-build-isolation .`。
+* 目安: SA2 1.5〜4 分 / SA3 2〜6 分。`sageattention3_blackwell/csrc/cutlass` は setup.py が
+  自動 clone する（約 230 MB、ネットワーク必須）。
+
+### 1.2 ケース B: spark-comfyui のコンテナ（他の DGX Spark は通常こちら）
+
+`/home/chai/ComfyUI/.venv` は**存在しない**。ComfyUI はイメージ内の
+`/opt/ComfyUI` + `/opt/comfyui-env` で動き、SageAttention は**イメージビルド時に焼き込まれる**:
+
+```
+container/Dockerfile:62   ARG SAGE_REPO=https://github.com/thu-ml/SageAttention.git
+container/Dockerfile:146  FROM torch AS sage ... git clone ${SAGE_REPO}; checkout ${SAGE_REF};
+                          CXX_APPEND_FLAGS=-std=c++20 NVCC_APPEND_FLAGS=-std=c++20
+                          pip install --no-build-isolation --no-deps .
+spark-comfyui.sh:205      SAGE_REF=${SAGE_REF:-d1a57a54...}      # upstream main を固定
+```
+
+つまり**既定のイメージは upstream を固定 SHA で入れている**（`spark-comfyui.sh` は
+`SAGE_REPO` をビルド引数に渡していない）。このフォークを入れたい場合は、イメージを
+自前でビルドし直して `SAGE_REPO` を差し替える:
+
+```bash
+# spark-comfyui.sh の build が使う引数に SAGE_REPO を足す（恒久）
+#   --build-arg SAGE_REPO=https://github.com/chai-md/SageAttention.git \
+#   --build-arg SAGE_REF=<このフォークの main の SHA>
+# あるいは同じ引数で docker build を直接叩く
+```
+
+その場で試すだけならコンテナ内に入れる（**イメージ更新で消える**点に注意）:
+
+```bash
+docker exec -it <container> bash -lc '
+  cd /opt && git clone https://github.com/chai-md/SageAttention.git sa-port &&
+  cd sa-port && CXX_APPEND_FLAGS="-std=c++20" NVCC_APPEND_FLAGS="-std=c++20" \
+  TORCH_CUDA_ARCH_LIST=12.1 MAX_JOBS=4 \
+    uv pip install --python /opt/comfyui-env/bin/python --no-build-isolation --no-deps . &&
+  cd sageattention3_blackwell && TORCH_CUDA_ARCH_LIST=12.1 MAX_JOBS=4 \
+    uv pip install --python /opt/comfyui-env/bin/python --no-build-isolation --no-deps .'
+```
+
+SA3（`sageattn3`）は Dockerfile の対象外なので、ケース B では必ず手動で入れる。
+
+### 1.3 検証（どの環境でも）
+
+```bash
+cd /tmp   # ← リポジトリ直下では source tree が import を隠す
+python -c "import sageattention, torch; print(sageattention.__version__)"
+python -c "import sageattn3; print('sa3 ok')"
+```
+
+ComfyUI 側は `--use-sage-attention` で有効化（起動ログに `Using sage attention`）。
+
+### 1.4 つまずきポイント
+
+| 症状 | 原因 / 対処 |
+|---|---|
+| `No module named pip` | venv に pip が無い → `uv pip` を使う |
+| `error: ... is not a member of ...` / C++17 エラー | C++20 未適用。SA2 は環境変数、**SA3 は setup.py 編集が必要** |
+| CUTLASS の clone が失敗 | ネットワーク/プロキシ。`git clone --depth 1 ... csrc/cutlass` を手動で |
+| ビルドが `Killed` / OOM（SA3） | CUTLASS のテンプレート展開が RAM を食う。`MAX_JOBS=4`、他プロセス停止（spark5 は MemAvailable 2.5 GiB で memguard が kill） |
+| `ImportError: _qattn_sm89...` など | アーキ差。`TORCH_CUDA_ARCH_LIST=12.1` を付けたか確認 |
+| 実行時 `undefined symbol` | ビルドした venv と実行する venv が違う |
+| リポジトリ直下で import できない | `cd /tmp` から実行（§6） |
 
 ## 2. 変更点
 
