@@ -46,6 +46,29 @@ df -h ~ | tail -1                       # CUTLASS 用に 1 GB 以上
 （`12.1a` でも可）。渡さないと GPU 検出にフォールバックし、他のカードで作った .so を
 持ち込んだときに `ImportError` になる。
 
+### 1.0b torch が入っていない / バージョンが違う場合
+
+SageAttention は**ビルド時に torch のヘッダを使う**ので、先に正しい CUDA 版の torch を
+入れておく必要がある。GB10（aarch64 / CUDA 13.x）では公式 index の wheel を使う:
+
+```bash
+uv pip install --python "$(command -v python)" \
+  torch==2.15.0 torchvision==0.29.2 torchaudio==2.11.1 \
+  --index-url https://download.pytorch.org/whl/cu132
+```
+
+* `--index-url` を付けないと PyPI の別ビルド（CPU 版や古い CUDA 版）を拾うことがある。
+* **バージョンは ComfyUI が要求する組み合わせに合わせる**。このマシンの実績は
+  torch 2.15.0+cu132 / torchvision 0.29.2+cu132 / torchaudio 2.11.1+cu132。
+  `cu130` の index を使うなら torch は 2.14.1 まで（`cu132` は 2.14.0〜2.15.0）。
+* 確認:
+  ```bash
+  python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_capability())"
+  # 2.15.0+cu132 13.0 True (12, 1)
+  ```
+* すでに ComfyUI が動いている仮想環境なら、**torch を入れ直さない**（壊す可能性がある）。
+  §1.0 の確認でバージョンが合っていればそのままビルドへ進む。
+
 ### 1.1 ケース A: ホストの仮想環境（このマシンの構成）
 
 ComfyUI が使っている仮想環境を有効化する。**パスは環境ごとに読み替える**
@@ -136,6 +159,8 @@ ComfyUI 側は `--use-sage-attention` で有効化（起動ログに `Using sage
 | 症状 | 原因 / 対処 |
 |---|---|
 | `No module named pip` | venv に pip が無い → `uv pip` を使う |
+| `No module named torch` / import したら CPU 版 | §1.0b の `--index-url .../cu132` で入れ直す |
+| wheel が見つからない（aarch64） | `--index-url` の CUDA 版と torch のバージョン指定を合わせる（cu130 は 2.14.1 まで） |
 | `error: ... is not a member of ...` / C++17 エラー | C++20 未適用。SA2 は環境変数、**SA3 は setup.py 編集が必要** |
 | CUTLASS の clone が失敗 | ネットワーク/プロキシ。`git clone --depth 1 ... csrc/cutlass` を手動で |
 | ビルドが `Killed` / OOM（SA3） | CUTLASS のテンプレート展開が RAM を食う。`MAX_JOBS=4`、他プロセス停止（spark5 は MemAvailable 2.5 GiB で memguard が kill） |
